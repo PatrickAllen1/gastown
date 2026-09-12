@@ -27,6 +27,7 @@ type nativeConvoyFakeRunner struct {
 	stdout []byte
 	stderr []byte
 	err    error
+	delay  time.Duration
 	calls  []nativeConvoyCall
 }
 
@@ -38,6 +39,15 @@ func (r *nativeConvoyFakeRunner) Run(ctx context.Context, executable string, arg
 		dir:        dir,
 		deadline:   deadline,
 	})
+	if r.delay > 0 {
+		timer := time.NewTimer(r.delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
 	return r.stdout, r.stderr, r.err
 }
 
@@ -111,6 +121,35 @@ func TestNativeConvoySourceCrossRigCountsNotZeroZero(t *testing.T) {
 	}
 	if call.deadline.IsZero() || time.Until(call.deadline) > nativeConvoyCommandTimeout+time.Second {
 		t.Fatalf("native convoy runner did not receive bounded deadline: %v", call.deadline)
+	}
+}
+
+func TestNativeConvoySourceAcceptsLargeSnapshotBeyondFormerTimeout(t *testing.T) {
+	const (
+		delay       = 9 * time.Second
+		snapshotLen = 181447
+	)
+	raw := nativeConvoyJSON("hq-cv-slow", "large healthy snapshot", "open")
+	raw = append(raw, bytes.Repeat([]byte{' '}, snapshotLen-len(raw))...)
+	if len(raw) != snapshotLen || len(raw) >= maxConvoyCommandOutputBytes {
+		t.Fatalf("delayed snapshot size = %d, want %d bytes below %d-byte cap", len(raw), snapshotLen, maxConvoyCommandOutputBytes)
+	}
+
+	runner := &nativeConvoyFakeRunner{stdout: raw, delay: delay}
+	started := time.Now()
+	state, err := newNativeConvoySource(t.TempDir(), runner).Fetch(context.Background())
+	elapsed := time.Since(started)
+	if elapsed <= 8*time.Second {
+		t.Fatalf("fake native snapshot completed in %s, want a delay beyond the former 8-second deadline", elapsed)
+	}
+	if err != nil {
+		t.Fatalf("Fetch delayed healthy snapshot: %v", err)
+	}
+	if len(state.All) != 1 || state.All[0].ID != "hq-cv-slow" {
+		t.Fatalf("delayed healthy snapshot state = %#v, want one parsed convoy", state)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("delayed snapshot invoked native runner %d times, want one", len(runner.calls))
 	}
 }
 

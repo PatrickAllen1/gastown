@@ -18,7 +18,9 @@ import (
 // the subprocess and all data it returns bounded so a damaged or wedged town
 // cannot stall the TUI or grow its memory without limit.
 const (
-	nativeConvoyCommandTimeout  = 8 * time.Second
+	// Healthy large-town snapshots have measured at about 11.63 seconds;
+	// retain finite cancellation while allowing bounded headroom for them.
+	nativeConvoyCommandTimeout  = 15 * time.Second
 	maxConvoyCommandOutputBytes = 256 * 1024
 )
 
