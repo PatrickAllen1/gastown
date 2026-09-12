@@ -13,6 +13,7 @@ type fakeMQPostMergeManager struct {
 	mr              *refinery.MergeRequest
 	findErr         error
 	postMergeErr    error
+	sourceErr       error
 	postMergeCalled bool
 	postMergeMR     *refinery.MergeRequest
 }
@@ -31,6 +32,19 @@ func (m *fakeMQPostMergeManager) PostMergeMR(mr *refinery.MergeRequest) (*refine
 		return nil, m.postMergeErr
 	}
 	return &refinery.PostMergeResult{MR: m.mr, MRClosed: true, SourceIssueClosed: true, SourceIssueID: m.mr.IssueID}, nil
+}
+
+func (m *fakeMQPostMergeManager) VerifyPostMergeSourceIssue(mr *refinery.MergeRequest) error {
+	if m.sourceErr != nil {
+		return m.sourceErr
+	}
+	if mr == nil || strings.TrimSpace(mr.IssueID) == "" {
+		return errors.New("missing source issue")
+	}
+	if branchIssue := strings.TrimSpace(parseBranchName(mr.Branch).Issue); branchIssue != "" && branchIssue != strings.TrimSpace(mr.IssueID) {
+		return errors.New("source issue does not own branch")
+	}
+	return nil
 }
 
 type fakeMQPostMergeGit struct {
@@ -357,6 +371,28 @@ func TestRunVerifiedMQPostMerge_PatchTransplantDivergenceFailsClosed(t *testing.
 	}
 }
 
+func TestRunVerifiedMQPostMerge_ForgedSourceIssueFailsClosed(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.IssueID = "gt-victim"
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		remoteTip:  mr.CommitSHA,
+		localHead:  mr.CommitSHA,
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "source issue") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want source issue authentication failure", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("PostMerge called for forged source issue")
+	}
+	if len(rigGit.deletedBranches) != 0 || len(rigGit.localDeleted) != 0 {
+		t.Fatalf("branch deleted for forged source issue: remote=%v local=%v", rigGit.deletedBranches, rigGit.localDeleted)
+	}
+}
+
 func TestRunVerifiedMQPostMerge_AcceptsRecordedMergedPRLanding(t *testing.T) {
 	mr := testMQPostMergeMR()
 	mr.PRURL = "https://github.com/upstream/repo/pull/42"
@@ -393,5 +429,116 @@ func TestRunVerifiedMQPostMerge_AcceptsRecordedMergedPRLanding(t *testing.T) {
 	}
 	if len(rigGit.verifiedCommits) != 2 || rigGit.verifiedCommits[1] != "landing987" {
 		t.Fatalf("verified commits = %v, want candidate and provider landing", rigGit.verifiedCommits)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_MergedPRMissingProviderLandingFailsClosed(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.MergeCommit = "recorded-landing"
+	mr.PRURL = "https://github.com/upstream/repo/pull/42"
+	mr.PRNumber = 42
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		patchErr:   errors.New("patch proof not used"),
+		lookupResult: &git.PullRequestInfo{
+			Number:         mr.PRNumber,
+			URL:            mr.PRURL,
+			State:          "MERGED",
+			HeadRefName:    mr.Branch,
+			HeadSHA:        mr.CommitSHA,
+			BaseRefName:    mr.TargetBranch,
+			MergeCommitSHA: "",
+		},
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "provider landing") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want missing provider landing failure", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("PostMerge called without provider landing SHA")
+	}
+	if mr.MergeCommit != "recorded-landing" {
+		t.Fatalf("MR merge commit persisted after missing provider metadata: %q", mr.MergeCommit)
+	}
+	if len(rigGit.deletedBranches) != 0 || len(rigGit.localDeleted) != 0 {
+		t.Fatalf("branch deleted without provider landing SHA: remote=%v local=%v", rigGit.deletedBranches, rigGit.localDeleted)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_MergedPRConflictingLandingFailsClosed(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.MergeCommit = "recorded-landing"
+	mr.PRURL = "https://github.com/upstream/repo/pull/42"
+	mr.PRNumber = 42
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{
+			mr.CommitSHA:   errors.New("candidate is not an ancestor"),
+			mr.MergeCommit: errors.New("recorded landing is not on target"),
+		},
+		patchErr: errors.New("patch proof not used"),
+		lookupResult: &git.PullRequestInfo{
+			Number:         mr.PRNumber,
+			URL:            mr.PRURL,
+			State:          "MERGED",
+			HeadRefName:    mr.Branch,
+			HeadSHA:        mr.CommitSHA,
+			BaseRefName:    mr.TargetBranch,
+			MergeCommitSHA: "provider-landing",
+		},
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want conflicting landing failure", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("PostMerge called with conflicting landing SHAs")
+	}
+	if mr.MergeCommit != "recorded-landing" {
+		t.Fatalf("MR merge commit mutated after conflicting provider metadata: %q", mr.MergeCommit)
+	}
+	if len(rigGit.deletedBranches) != 0 || len(rigGit.localDeleted) != 0 {
+		t.Fatalf("branch deleted with conflicting landing SHAs: remote=%v local=%v", rigGit.deletedBranches, rigGit.localDeleted)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_MergedPRUnreachableProviderLandingFailsClosed(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.PRURL = "https://github.com/upstream/repo/pull/42"
+	mr.PRNumber = 42
+	const providerLanding = "provider-landing"
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{
+			mr.CommitSHA:    errors.New("candidate is not an ancestor"),
+			providerLanding: errors.New("provider landing is unreachable"),
+		},
+		patchErr: errors.New("patch proof not used"),
+		lookupResult: &git.PullRequestInfo{
+			Number:         mr.PRNumber,
+			URL:            mr.PRURL,
+			State:          "MERGED",
+			HeadRefName:    mr.Branch,
+			HeadSHA:        mr.CommitSHA,
+			BaseRefName:    mr.TargetBranch,
+			MergeCommitSHA: providerLanding,
+		},
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "not on target") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want unreachable provider landing failure", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("PostMerge called for unreachable provider landing")
+	}
+	if mr.MergeCommit != "" {
+		t.Fatalf("MR merge commit persisted after unreachable provider metadata: %q", mr.MergeCommit)
+	}
+	if len(rigGit.deletedBranches) != 0 || len(rigGit.localDeleted) != 0 {
+		t.Fatalf("branch deleted for unreachable provider landing: remote=%v local=%v", rigGit.deletedBranches, rigGit.localDeleted)
 	}
 }

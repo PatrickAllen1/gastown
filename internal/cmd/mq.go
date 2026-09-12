@@ -218,6 +218,13 @@ type mqPostMergePRProofGit interface {
 	LookupPullRequest(ref git.PullRequestRef) (*git.PullRequestInfo, error)
 }
 
+// mqPostMergeSourceAuthority is an optional source-ownership seam for tests
+// and alternate managers. The production refinery manager does not implement
+// it; production proof uses the authoritative routed beads lookup below.
+type mqPostMergeSourceAuthority interface {
+	VerifyPostMergeSourceIssue(mr *refinery.MergeRequest) error
+}
+
 type mqPostMergeBranchCleanup struct {
 	Branch        string
 	NoBranch      bool
@@ -600,7 +607,7 @@ func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPos
 	if err != nil {
 		return nil, mqPostMergeBranchCleanup{}, err
 	}
-	if err := verifyMQPostMergeProof(rigGit, mr); err != nil {
+	if err := verifyMQPostMergeProofAt(rigPath, mgr, rigGit, mr); err != nil {
 		return nil, mqPostMergeBranchCleanup{}, err
 	}
 
@@ -614,6 +621,10 @@ func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPos
 }
 
 func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {
+	return verifyMQPostMergeProofAt("", nil, rigGit, mr)
+}
+
+func verifyMQPostMergeProofAt(rigPath string, mgr mqPostMergeManager, rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {
 	if mr == nil {
 		return fmt.Errorf("merge proof failed: merge request is missing")
 	}
@@ -637,15 +648,99 @@ func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) er
 	// preserving its commit object (for example, a transplant or squash).
 	// Keep ancestry as the primary proof and accept a fallback only when it
 	// has exact source-bound target evidence (and, when available, durable
-	// Refinery landing metadata).
-	if verifyErr := verifyMQPostMergePatchLanding(rigGit, mr, target, commit); verifyErr == nil {
+	// Refinery landing metadata). Authenticate the source issue before trying
+	// either fallback so a forged IssueID cannot reach lifecycle mutation.
+	if sourceErr := verifyMQPostMergeSourceIssue(rigPath, mgr, mr); sourceErr != nil {
+		return fmt.Errorf("merge proof failed for MR %s: source issue authentication failed: %w", mr.ID, sourceErr)
+	}
+	patchErr := verifyMQPostMergePatchLanding(rigGit, mr, target, commit)
+	if patchErr == nil {
 		return nil
 	}
-	if verifyErr := verifyMQPostMergePRLanding(rigGit, mr, target, commit); verifyErr == nil {
+	prErr := verifyMQPostMergePRLanding(rigGit, mr, target, commit)
+	if prErr == nil {
 		return nil
 	}
 
-	return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w", mr.ID, target, commit, ancestryErr)
+	return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w (patch landing: %v; merged PR: %v)", mr.ID, target, commit, ancestryErr, patchErr, prErr)
+}
+
+// verifyMQPostMergeSourceIssue binds an ancestry-negative landing to the
+// source issue that owns the submitted branch and commit. Generated polecat
+// branches carry that identity directly; custom branches use the authoritative
+// source issue lookup and the submission back-link instead of trusting the MR
+// IssueID field by itself.
+func verifyMQPostMergeSourceIssue(rigPath string, mgr mqPostMergeManager, mr *refinery.MergeRequest) error {
+	if mr == nil {
+		return fmt.Errorf("merge request is missing")
+	}
+	sourceIssue := strings.TrimSpace(mr.IssueID)
+	if sourceIssue == "" {
+		return fmt.Errorf("missing source issue")
+	}
+	if strings.TrimSpace(mr.ID) == "" {
+		return fmt.Errorf("missing merge request ID")
+	}
+	branch := strings.TrimSpace(mr.Branch)
+	if branch == "" {
+		return fmt.Errorf("missing source branch")
+	}
+
+	// Canonical polecat branches are generated from the exact hooked issue. Do
+	// not accept a different (or merely non-empty) IssueID for that branch.
+	branchIssue := strings.TrimSpace(parseBranchName(branch).Issue)
+	if branchIssue != "" {
+		if branchIssue != sourceIssue {
+			return fmt.Errorf("source issue %s does not own branch %s (branch identifies %s)", sourceIssue, branch, branchIssue)
+		}
+	}
+
+	// An optional authority keeps small proof fakes independent of a beads
+	// process. It still runs after the canonical branch identity check above.
+	if authority, ok := mgr.(mqPostMergeSourceAuthority); ok {
+		return authority.VerifyPostMergeSourceIssue(mr)
+	}
+	if strings.TrimSpace(rigPath) == "" {
+		if branchIssue != "" {
+			return nil
+		}
+		return fmt.Errorf("source issue ownership proof unavailable for custom branch %s", branch)
+	}
+	source, err := resolveSubmitSourceIssue(rigPath, sourceIssue)
+	if err != nil {
+		return err
+	}
+	if source == nil || source.BD == nil {
+		return fmt.Errorf("source issue %s ownership lookup returned no authoritative beads source", sourceIssue)
+	}
+	if source.Issue == nil || strings.TrimSpace(source.Issue.ID) != sourceIssue {
+		return fmt.Errorf("authoritative source issue identity mismatch: got %q, want %q", sourceIssueID(source), sourceIssue)
+	}
+
+	// A canonical branch carries the exact issue identity. For custom branches,
+	// require the submission's source back-link as the durable branch/commit
+	// ownership record.
+	if branchIssue != "" {
+		return nil
+	}
+	comments, err := source.BD.Comments(sourceIssue)
+	if err != nil {
+		return fmt.Errorf("read source issue %s ownership record: %w", sourceIssue, err)
+	}
+	want := "MR created: " + strings.TrimSpace(mr.ID)
+	for _, comment := range comments {
+		if strings.TrimSpace(comment.Text) == want {
+			return nil
+		}
+	}
+	return fmt.Errorf("source issue %s has no ownership record for MR %s", sourceIssue, strings.TrimSpace(mr.ID))
+}
+
+func sourceIssueID(source *submitSourceIssue) string {
+	if source == nil || source.Issue == nil {
+		return ""
+	}
+	return strings.TrimSpace(source.Issue.ID)
 }
 
 // verifyMQPostMergePatchLanding accepts a patch transplant only when the exact
@@ -723,15 +818,16 @@ func verifyMQPostMergePRLanding(rigGit mqPostMergeGit, mr *refinery.MergeRequest
 
 	landing := strings.TrimSpace(pr.MergeCommitSHA)
 	if landing == "" {
-		landing = strings.TrimSpace(mr.MergeCommit)
-	}
-	if landing == "" {
 		return fmt.Errorf("missing provider landing commit")
+	}
+	recordedLanding := strings.TrimSpace(mr.MergeCommit)
+	if recordedLanding != "" && recordedLanding != landing {
+		return fmt.Errorf("provider landing commit %s conflicts with recorded merge commit %s", landing, recordedLanding)
 	}
 	if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, landing); err != nil {
 		return fmt.Errorf("provider landing commit %s is not on target: %w", landing, err)
 	}
-	if strings.TrimSpace(mr.MergeCommit) == "" {
+	if recordedLanding == "" {
 		mr.MergeCommit = landing
 	}
 	return nil
