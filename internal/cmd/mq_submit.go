@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,288 @@ type branchInfo struct {
 	Branch string // Full branch name
 	Issue  string // Issue ID extracted from branch
 	Worker string // Worker name (polecat name)
+}
+
+// mqSubmitRigContext binds one submission to the registered owning rig. The
+// source Git wrapper can point at an external candidate worktree, while Beads
+// and push/target verification use the owning-rig authority.
+type mqSubmitRigContext struct {
+	RigName      string
+	Rig          *rig.Rig
+	Registry     config.RigEntry
+	External     bool
+	BeadsWorkDir string
+	AuthorityGit *git.Git
+}
+
+// resolveMQSubmitRig resolves a registered rig for a submission. A path
+// outside the town is never interpreted as a rig named ".."; it requires an
+// explicit registered rig instead.
+func resolveMQSubmitRig(townRoot, cwd, explicitRig string) (*mqSubmitRigContext, error) {
+	townRoot = filepath.Clean(townRoot)
+	cwd = filepath.Clean(cwd)
+	explicitRig = strings.TrimSpace(explicitRig)
+
+	rigName := explicitRig
+	if rigName == "" {
+		if !mqSubmitPathWithin(townRoot, cwd) {
+			return nil, fmt.Errorf("current directory %q is outside Gas Town; use --rig <registered-rig> for an external worktree", cwd)
+		}
+		relPath, err := filepath.Rel(townRoot, cwd)
+		if err != nil {
+			return nil, fmt.Errorf("computing rig path: %w", err)
+		}
+		parts := strings.Split(relPath, string(filepath.Separator))
+		if len(parts) > 0 && parts[0] != "" && parts[0] != "." {
+			rigName = parts[0]
+		} else {
+			rigName = strings.TrimSpace(os.Getenv("GT_RIG"))
+		}
+	}
+	if rigName == "" {
+		return nil, fmt.Errorf("cannot determine owning rig; use --rig <registered-rig>")
+	}
+	if filepath.Base(rigName) != rigName || strings.ContainsAny(rigName, `/\\`) || rigName == "." || rigName == ".." {
+		return nil, fmt.Errorf("invalid rig name %q", rigName)
+	}
+
+	rigsConfig, err := config.LoadRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"))
+	if err != nil {
+		return nil, fmt.Errorf("loading registered rigs: %w", err)
+	}
+	entry, ok := rigsConfig.Rigs[rigName]
+	if !ok {
+		return nil, fmt.Errorf("rig %q is not registered", rigName)
+	}
+
+	rigMgr := rig.NewManager(townRoot, rigsConfig, git.NewGit(townRoot))
+	owner, err := rigMgr.GetRig(rigName)
+	if err != nil {
+		return nil, fmt.Errorf("registered rig %q is unavailable: %w", rigName, err)
+	}
+
+	external := !mqSubmitPathWithin(townRoot, cwd)
+	beadsWorkDir := cwd
+	if external || explicitRig != "" {
+		beadsWorkDir = owner.Path
+	}
+	return &mqSubmitRigContext{
+		RigName:      rigName,
+		Rig:          owner,
+		Registry:     entry,
+		External:     external,
+		BeadsWorkDir: beadsWorkDir,
+		AuthorityGit: mqSubmitAuthorityGit(owner),
+	}, nil
+}
+
+func mqSubmitPathWithin(base, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// mqSubmitAuthorityGit selects a managed rig clone for authoritative remote
+// checks. The rig root is preferred, followed by the standard Refinery and
+// Mayor clones. No per-rig config value is used as a remote authority.
+func mqSubmitAuthorityGit(owner *rig.Rig) *git.Git {
+	if owner == nil {
+		return nil
+	}
+	candidates := []string{
+		owner.Path,
+		filepath.Join(owner.Path, "refinery", "rig"),
+		filepath.Join(owner.Path, "mayor", "rig"),
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(filepath.Join(candidate, ".git")); err == nil && (info.IsDir() || info.Mode().IsRegular()) {
+			return git.NewGit(candidate)
+		}
+	}
+	return nil
+}
+
+// registeredMQSubmitPushTarget returns only the registered target. GitURL is
+// the intentional fallback when PushURL is absent; rig-local config is not an
+// authority because it can silently disagree with the town registry.
+func registeredMQSubmitPushTarget(ctx *mqSubmitRigContext) (string, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("owning rig context is missing")
+	}
+	if target := strings.TrimSpace(ctx.Registry.PushURL); target != "" {
+		return target, nil
+	}
+	if target := strings.TrimSpace(ctx.Registry.GitURL); target != "" {
+		return target, nil
+	}
+	return "", fmt.Errorf("rig %q has no registered GitURL or PushURL", ctx.RigName)
+}
+
+func validateRegisteredMQSubmitPushTarget(authority *git.Git, registered string) error {
+	registered = strings.TrimSpace(registered)
+	if registered == "" {
+		return fmt.Errorf("registered push target is empty")
+	}
+	if authority == nil {
+		return fmt.Errorf("registered push target has no owning-rig repository")
+	}
+	configured, err := authority.GetPushURL("origin")
+	if err != nil {
+		return fmt.Errorf("reading owning-rig push target: %w", err)
+	}
+	if normalizeMQSubmitRemoteURL(configured) != normalizeMQSubmitRemoteURL(registered) {
+		return fmt.Errorf("owning-rig push target %q does not match registered target %q", configured, registered)
+	}
+	return nil
+}
+
+// normalizeMQSubmitRemoteURL removes only syntax that is proven equivalent:
+// URL case in the host, a trailing slash, and a trailing .git suffix. It keeps
+// the scheme, host, port, and path distinct so HTTPS/SSH or different hosts and
+// repositories cannot be treated as the same push endpoint.
+func normalizeMQSubmitRemoteURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	// Git's scp-like SSH spelling is equivalent to ssh://host/path, but not to
+	// HTTPS or another transport. Ignore the login name; the endpoint identity
+	// is represented by the SSH transport, host, and repository path.
+	if !strings.Contains(raw, "://") {
+		if colon := strings.IndexByte(raw, ':'); colon > 0 && strings.Contains(raw[:colon], "@") {
+			loginHost := raw[:colon]
+			pathPart := raw[colon+1:]
+			if at := strings.LastIndexByte(loginHost, '@'); at >= 0 && at+1 < len(loginHost) {
+				host := strings.ToLower(loginHost[at+1:])
+				return "ssh://" + host + normalizeMQSubmitRemotePath("/"+pathPart)
+			}
+		}
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		// Malformed or scheme-less values are compared byte-for-byte after the
+		// minimal suffix normalization, which is fail-closed for authority use.
+		return strings.TrimSuffix(strings.TrimSuffix(raw, "/"), ".git")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+	if port := parsed.Port(); port != "" {
+		host += ":" + port
+	}
+	remotePath := parsed.EscapedPath()
+	if remotePath == "" {
+		remotePath = "/"
+	}
+	remotePath = normalizeMQSubmitRemotePath(remotePath)
+	result := scheme + "://"
+	if host != "" {
+		result += host
+	}
+	result += remotePath
+	if parsed.RawQuery != "" {
+		result += "?" + parsed.RawQuery
+	}
+	if parsed.Fragment != "" {
+		result += "#" + parsed.Fragment
+	}
+	return result
+}
+
+func normalizeMQSubmitRemotePath(remotePath string) string {
+	remotePath = strings.TrimRight(remotePath, "/")
+	remotePath = strings.TrimSuffix(remotePath, ".git")
+	if remotePath == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(remotePath, "/") {
+		return "/" + remotePath
+	}
+	return remotePath
+}
+
+func validateMQSubmitTargetName(target string) error {
+	if target != strings.TrimSpace(target) {
+		return fmt.Errorf("invalid target branch %q", target)
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return fmt.Errorf("target branch is required")
+	}
+	if err := validateBranchName(target); err != nil {
+		return fmt.Errorf("invalid target branch %q: %w", target, err)
+	}
+	if target == "HEAD" || strings.HasPrefix(target, "refs/") || strings.HasPrefix(target, "origin/") || strings.HasPrefix(target, "upstream/") || strings.HasPrefix(target, "-") {
+		return fmt.Errorf("invalid target branch %q", target)
+	}
+	for _, r := range target {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid target branch %q", target)
+		}
+	}
+	for _, part := range strings.Split(target, "/") {
+		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return fmt.Errorf("invalid target branch %q", target)
+		}
+	}
+	return nil
+}
+
+func mqSubmitExplicitTarget(explicit, configured string) string {
+	if target := strings.TrimSpace(explicit); target != "" {
+		return target
+	}
+	return strings.TrimSpace(configured)
+}
+
+func validateMQSubmitSourceTarget(source, target string) error {
+	if strings.TrimSpace(source) == strings.TrimSpace(target) {
+		return fmt.Errorf("source branch %q cannot be the target branch", source)
+	}
+	return nil
+}
+
+func validateMQSubmitExistingMR(mr *beads.Issue, branch, target, rigName, commitSHA string) error {
+	if mr == nil {
+		return fmt.Errorf("merge request is missing")
+	}
+	fields := beads.ParseMRFields(mr)
+	if fields == nil {
+		return fmt.Errorf("merge request %s has no structured routing fields", mr.ID)
+	}
+	if strings.TrimSpace(fields.Branch) != strings.TrimSpace(branch) {
+		return fmt.Errorf("merge request %s source branch %q does not match %q", mr.ID, fields.Branch, branch)
+	}
+	if strings.TrimSpace(fields.Target) != strings.TrimSpace(target) {
+		return fmt.Errorf("merge request %s target %q does not match %q", mr.ID, fields.Target, target)
+	}
+	if strings.TrimSpace(fields.Rig) != strings.TrimSpace(rigName) {
+		return fmt.Errorf("merge request %s rig %q does not match %q", mr.ID, fields.Rig, rigName)
+	}
+	if strings.TrimSpace(fields.CommitSHA) != strings.TrimSpace(commitSHA) {
+		return fmt.Errorf("merge request %s commit_sha %q does not match %q", mr.ID, fields.CommitSHA, commitSHA)
+	}
+	return nil
+}
+
+func validateMQSubmitTarget(authority *git.Git, target string) error {
+	if err := validateMQSubmitTargetName(target); err != nil {
+		return err
+	}
+	if authority == nil {
+		return fmt.Errorf("cannot validate target %q without owning-rig repository", target)
+	}
+	exists, err := authority.PushRemoteBranchExists("origin", target)
+	if err != nil {
+		return fmt.Errorf("validate target branch %q on registered push target: %w", target, err)
+	}
+	if !exists {
+		return fmt.Errorf("target branch %q does not exist on registered push target", target)
+	}
+	return nil
 }
 
 // issuePattern matches issue IDs in branch names (e.g., "gt-xyz" or "gt-abc.1")
@@ -63,16 +346,21 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	// Find current rig
-	rigName, _, err := findCurrentRig(townRoot)
-	if err != nil {
-		return err
-	}
-
-	// Initialize git for the current directory
+	// Read the source worktree before resolving the owning rig. An external
+	// worktree is allowed only when --rig explicitly selects a registered rig.
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
+	}
+	explicitRig := strings.TrimSpace(mqSubmitRig)
+	discoveredRig := explicitRig
+	if explicitRig == "" {
+		// Preserve the town-root shell-alias behavior, but reject paths outside
+		// the town rather than accepting filepath.Rel's ".." as a rig name.
+		discoveredRig, _, err = findCurrentRig(townRoot)
+		if err != nil {
+			return err
+		}
 	}
 
 	// When gt is invoked via shell alias (cd ~/gt && gt), cwd is the town
@@ -86,25 +374,44 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		} else {
 			isPolecat = os.Getenv("GT_POLECAT") != ""
 		}
-		if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" && rigName != "" && isPolecat {
-			polecatClone := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+		if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" && discoveredRig != "" && isPolecat {
+			polecatClone := filepath.Join(townRoot, discoveredRig, "polecats", polecatName, discoveredRig)
 			if _, err := os.Stat(polecatClone); err == nil {
 				cwd = polecatClone
 			} else {
-				polecatClone = filepath.Join(townRoot, rigName, "polecats", polecatName)
+				polecatClone = filepath.Join(townRoot, discoveredRig, "polecats", polecatName)
 				if _, err := os.Stat(filepath.Join(polecatClone, ".git")); err == nil {
 					cwd = polecatClone
 				}
 			}
-		} else if crewName := os.Getenv("GT_CREW"); crewName != "" && rigName != "" {
-			crewClone := filepath.Join(townRoot, rigName, "crew", crewName)
+		} else if crewName := os.Getenv("GT_CREW"); crewName != "" && discoveredRig != "" {
+			crewClone := filepath.Join(townRoot, discoveredRig, "crew", crewName)
 			if _, err := os.Stat(crewClone); err == nil {
 				cwd = crewClone
 			}
 		}
 	}
 
+	// Resolve the registered owner after shell-alias cwd reconstruction. The
+	// source Git wrapper remains bound to cwd, while owner Beads and push/target
+	// verification are bound to this context for external candidates.
+	submitRig, err := resolveMQSubmitRig(townRoot, cwd, explicitRig)
+	if err != nil {
+		return err
+	}
+	rigName := submitRig.RigName
 	g := git.NewGit(cwd)
+	verificationGit := g
+	if submitRig.External || explicitRig != "" {
+		registeredTarget, targetErr := registeredMQSubmitPushTarget(submitRig)
+		if targetErr != nil {
+			return targetErr
+		}
+		if targetErr := validateRegisteredMQSubmitPushTarget(submitRig.AuthorityGit, registeredTarget); targetErr != nil {
+			return targetErr
+		}
+		verificationGit = submitRig.AuthorityGit
+	}
 
 	// Get current branch
 	branch := mqSubmitBranch
@@ -139,24 +446,28 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
 	}
 
-	// Initialize current-rig beads for merge-request queue operations, then
-	// resolve the source through town-level routing for source-owned operations.
-	bd := beads.New(cwd)
-	sourceInfo, err := resolveSubmitSourceIssue(cwd, issueID)
+	// Initialize the owning-rig Beads context for external/explicit routing,
+	// then resolve the source through town-level routing for source-owned ops.
+	beadsWorkDir := cwd
+	if submitRig.External || explicitRig != "" {
+		beadsWorkDir = submitRig.BeadsWorkDir
+	}
+	bd := beads.New(beadsWorkDir)
+	sourceInfo, err := resolveSubmitSourceIssue(beadsWorkDir, issueID)
 	if err != nil {
 		return fmt.Errorf("source issue validation failed: %w", err)
 	}
 	sourceBD := sourceInfo.BD
 	sourceIssue := sourceInfo.Issue
 
-	// Determine target branch
-	// Priority: explicit --epic > formula_vars base_branch > integration branch auto-detect > rig default.
-	target := defaultBranch
-	if mqSubmitEpic != "" {
+	// Determine target branch. Priority: explicit --target > --epic >
+	// formula_vars base_branch > integration branch auto-detect > rig default.
+	target := mqSubmitExplicitTarget(mqSubmitTarget, defaultBranch)
+	if strings.TrimSpace(mqSubmitTarget) == "" && mqSubmitEpic != "" {
 		// Explicit --epic flag: read stored branch name, fall back to template
 		rigPath := filepath.Join(townRoot, rigName)
 		target = resolveIntegrationBranchName(sourceBD, rigPath, mqSubmitEpic)
-	} else {
+	} else if strings.TrimSpace(mqSubmitTarget) == "" {
 		// Check for explicit --base-branch override in formula vars on the source issue.
 		// When gt sling dispatches with --base-branch, the value is persisted in
 		// the bead's formula_vars field. Without this check, MRs created via
@@ -179,7 +490,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 				refineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()
 			}
 			if refineryEnabled {
-				autoTarget, err := beads.DetectIntegrationBranch(sourceBD, g, issueID)
+				autoTarget, err := beads.DetectIntegrationBranch(sourceBD, verificationGit, issueID)
 				if err != nil {
 					// Non-fatal: log and continue with default branch as target
 					fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("(note: %v)", err)))
@@ -188,6 +499,13 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
+	}
+
+	if err := validateMQSubmitSourceTarget(branch, target); err != nil {
+		return err
+	}
+	if err := validateMQSubmitTarget(verificationGit, target); err != nil {
+		return err
 	}
 
 	// Get source issue for priority inheritance and dependency check
@@ -210,9 +528,9 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 
 	// GH#3032/wa-skj: resolve the submitted branch tip for MR dedup and
 	// verification. With --branch this can differ from the checked-out HEAD.
-	commitSHA, shaErr := resolveMQSubmitCommitSHA(g, branch)
-	if shaErr != nil {
-		style.PrintWarning("could not resolve submitted branch SHA: %v (falling back to branch-only dedup)", shaErr)
+	commitSHA, err := resolveMQSubmitCommitSHA(g, branch)
+	if err != nil {
+		return fmt.Errorf("could not resolve submitted branch SHA: %w", err)
 	}
 
 	// Build MR bead title and description
@@ -229,26 +547,24 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	// Verify before either an idempotent success or a new MR registration.
 	// Refinery's later branch check is local-ref based, so missing/stale pushes
 	// must fail here instead of producing a delayed refinery rejection.
-	if err := verifyMQSubmitPushedBranch(g, branch, commitSHA); err != nil {
+	if err := verifyMQSubmitPushedBranch(verificationGit, branch, commitSHA); err != nil {
 		return err
 	}
 
 	// Check if MR bead already exists for this branch+SHA (idempotency)
 	var mrIssue *beads.Issue
 	var existingMR *beads.Issue
-	if commitSHA != "" {
-		existingMR, err = bd.FindMRForBranchAndSHA(branch, commitSHA)
-	} else {
-		existingMR, err = bd.FindMRForBranch(branch)
-	}
+	existingMR, err = bd.FindMRForBranchAndSHA(branch, commitSHA)
 	if err != nil {
-		style.PrintWarning("could not check for existing MR: %v", err)
-		// Dedup check failed — fall through to create a new MR
+		return fmt.Errorf("checking for existing merge request: %w", err)
 	}
 
 	if existingMR != nil {
 		if err := validateMergeRequestSource(existingMR, issueID, sourceIssue); err != nil {
 			return fmt.Errorf("existing merge request validation failed: %w", err)
+		}
+		if err := validateMQSubmitExistingMR(existingMR, branch, target, rigName, commitSHA); err != nil {
+			return fmt.Errorf("existing merge request routing failed: %w", err)
 		}
 		mrIssue = existingMR
 		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))

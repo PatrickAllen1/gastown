@@ -24,6 +24,8 @@ var (
 	mqSubmitBranch    string
 	mqSubmitIssue     string
 	mqSubmitEpic      string
+	mqSubmitRig       string
+	mqSubmitTarget    string
 	mqSubmitPriority  int
 	mqSubmitNoCleanup bool
 	mqSubmitSkipDeps  bool
@@ -87,8 +89,8 @@ Auto-detection:
   - Branch: current git branch
   - Issue: parsed from branch name (e.g., polecat/Nux/gp-xyz → gt-xyz)
   - Worker: parsed from branch name
-  - Rig: detected from current directory
-  - Target: automatically determined (see below)
+  - Rig: detected from current directory, or explicitly selected with --rig
+  - Target: explicitly selected with --target, or automatically determined (see below)
   - Priority: inherited from source issue
 
 Target branch auto-detection:
@@ -108,6 +110,7 @@ Polecat auto-cleanup:
 
 Examples:
   gt mq submit                           # Auto-detect everything + auto-cleanup
+  gt mq submit --rig gastown --target main # Submit an external worktree to a registered rig
   gt mq submit --issue gp-abc            # Explicit issue
   gt mq submit --epic gt-xyz             # Target integration branch explicitly
   gt mq submit --priority 0              # Override priority (P0)
@@ -352,6 +355,8 @@ func init() {
 	mqSubmitCmd.Flags().StringVar(&mqSubmitBranch, "branch", "", "Source branch (default: current branch)")
 	mqSubmitCmd.Flags().StringVar(&mqSubmitIssue, "issue", "", "Source issue ID (default: parse from branch name)")
 	mqSubmitCmd.Flags().StringVar(&mqSubmitEpic, "epic", "", "Target epic's integration branch instead of main")
+	mqSubmitCmd.Flags().StringVar(&mqSubmitRig, "rig", "", "Owning registered rig (required outside the Gas Town workspace)")
+	mqSubmitCmd.Flags().StringVar(&mqSubmitTarget, "target", "", "Exact target branch (overrides configured integration/default target)")
 	mqSubmitCmd.Flags().IntVarP(&mqSubmitPriority, "priority", "p", -1, "Override priority (0-4, default: inherit from issue)")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitNoCleanup, "no-cleanup", false, "Don't auto-cleanup after submit (for polecats)")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitSkipDeps, "skip-deps", false, "Skip molecule step dependency check")
@@ -422,9 +427,14 @@ func findCurrentRig(townRoot string) (string, *rig.Rig, error) {
 		return "", nil, fmt.Errorf("computing relative path: %w", err)
 	}
 
-	// The first component of the relative path should be the rig name
+	// The first component of the relative path should be the rig name. A path
+	// outside the town begins with ".."; never reinterpret that sentinel as a
+	// registered rig (external candidates must use --rig).
 	parts := strings.Split(relPath, string(filepath.Separator))
 	rigName := ""
+	if len(parts) > 0 && parts[0] == ".." {
+		return "", nil, fmt.Errorf("current directory %q is outside Gas Town; use --rig <registered-rig> for an external worktree", cwd)
+	}
 	if len(parts) > 0 && parts[0] != "" && parts[0] != "." {
 		rigName = parts[0]
 	}

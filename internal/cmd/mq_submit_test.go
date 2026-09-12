@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
+	rigpkg "github.com/steveyegge/gastown/internal/rig"
 )
 
 func TestResolveMQSubmitCommitSHAUsesSubmittedBranch(t *testing.T) {
@@ -78,6 +80,244 @@ func TestVerifyMQSubmitPushedBranchRequiresRemoteBranch(t *testing.T) {
 	runGitForMQSubmitTest(t, repo, "push", "origin", "feature/pr-target")
 	if err := verifyMQSubmitPushedBranch(g, "feature/pr-target", featureSHA); err != nil {
 		t.Fatalf("verifyMQSubmitPushedBranch() after push: %v", err)
+	}
+}
+
+func TestRegisteredMQSubmitPushTargetPrefersRegisteredPushURL(t *testing.T) {
+	ctx := &mqSubmitRigContext{
+		RigName: "gastown",
+		Registry: config.RigEntry{
+			GitURL:  "https://github.com/example/gastown.git",
+			PushURL: "ssh://git@github.com/example/private-gastown.git",
+		},
+	}
+
+	got, err := registeredMQSubmitPushTarget(ctx)
+	if err != nil {
+		t.Fatalf("registeredMQSubmitPushTarget() error = %v", err)
+	}
+	if got != ctx.Registry.PushURL {
+		t.Fatalf("registeredMQSubmitPushTarget() = %q, want registered PushURL %q", got, ctx.Registry.PushURL)
+	}
+}
+
+func TestRegisteredMQSubmitPushTargetFallsBackToRegisteredGitURL(t *testing.T) {
+	ctx := &mqSubmitRigContext{
+		RigName:  "gastown",
+		Registry: config.RigEntry{GitURL: "https://github.com/example/gastown.git"},
+	}
+
+	got, err := registeredMQSubmitPushTarget(ctx)
+	if err != nil {
+		t.Fatalf("registeredMQSubmitPushTarget() error = %v", err)
+	}
+	if got != ctx.Registry.GitURL {
+		t.Fatalf("registeredMQSubmitPushTarget() = %q, want registered GitURL %q", got, ctx.Registry.GitURL)
+	}
+}
+
+func TestRegisteredMQSubmitPushTargetNeverUsesRigLocalFallback(t *testing.T) {
+	rigPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(`{"push_url":"https://local.invalid/not-authoritative.git"}
+`), 0o644); err != nil {
+		t.Fatalf("write rig config: %v", err)
+	}
+	ctx := &mqSubmitRigContext{
+		RigName: "gastown",
+		Rig:     &rigpkg.Rig{Path: rigPath},
+		Registry: config.RigEntry{
+			GitURL: "https://github.com/example/gastown.git",
+		},
+	}
+
+	got, err := registeredMQSubmitPushTarget(ctx)
+	if err != nil {
+		t.Fatalf("registeredMQSubmitPushTarget() error = %v", err)
+	}
+	if got != ctx.Registry.GitURL {
+		t.Fatalf("registeredMQSubmitPushTarget() = %q, want registered GitURL %q", got, ctx.Registry.GitURL)
+	}
+}
+
+func TestNormalizeMQSubmitRemoteURLPreservesUnprovenEndpointDifferences(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{
+			name:  "transport mismatch",
+			left:  "https://github.com/example/gastown.git",
+			right: "ssh://git@github.com/example/gastown.git",
+		},
+		{
+			name:  "host mismatch",
+			left:  "https://github.com/example/gastown.git",
+			right: "https://gitlab.com/example/gastown.git",
+		},
+		{
+			name:  "path mismatch",
+			left:  "https://github.com/example/gastown.git",
+			right: "https://github.com/other/gastown.git",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if left, right := normalizeMQSubmitRemoteURL(tt.left), normalizeMQSubmitRemoteURL(tt.right); left == right {
+				t.Fatalf("normalizeMQSubmitRemoteURL() collapsed %s: %q and %q", tt.name, left, right)
+			}
+		})
+	}
+}
+
+func TestNormalizeMQSubmitRemoteURLAcceptsOnlyEquivalentEndpointSyntax(t *testing.T) {
+	equivalent := [][2]string{
+		{"https://GITHUB.com/example/gastown.git", "https://github.com/example/gastown/"},
+		{"git@github.com:example/gastown.git", "ssh://git@github.com/example/gastown/"},
+	}
+	for _, pair := range equivalent {
+		left, right := normalizeMQSubmitRemoteURL(pair[0]), normalizeMQSubmitRemoteURL(pair[1])
+		if left != right {
+			t.Errorf("normalizeMQSubmitRemoteURL(%q, %q) = %q, %q; want equivalent", pair[0], pair[1], left, right)
+		}
+	}
+}
+
+func TestResolveMQSubmitRigRejectsExternalCwdWithoutExplicitRig(t *testing.T) {
+	townRoot := t.TempDir()
+	outside := t.TempDir()
+	writeMQSubmitTownRegistry(t, townRoot, map[string]config.RigEntry{
+		"gastown": {GitURL: "git@example.invalid/gastown.git", PushURL: "git@example.invalid/private/gastown.git"},
+	})
+	if _, err := resolveMQSubmitRig(townRoot, outside, ""); err == nil || !strings.Contains(err.Error(), "--rig") {
+		t.Fatalf("resolveMQSubmitRig() error = %v, want explicit --rig rejection", err)
+	}
+	if _, err := resolveMQSubmitRig(townRoot, outside, "unknown"); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("resolveMQSubmitRig(unknown) error = %v, want unknown-rig rejection", err)
+	}
+}
+
+func TestResolveMQSubmitRigUsesRegisteredOwnerForExternalSource(t *testing.T) {
+	townRoot := t.TempDir()
+	outside := t.TempDir()
+	owner := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(owner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMQSubmitTownRegistry(t, townRoot, map[string]config.RigEntry{
+		"gastown": {GitURL: "git@example.invalid/gastown.git", PushURL: "git@example.invalid/private/gastown.git"},
+	})
+
+	resolved, err := resolveMQSubmitRig(townRoot, outside, "gastown")
+	if err != nil {
+		t.Fatalf("resolveMQSubmitRig() error = %v", err)
+	}
+	if resolved.RigName != "gastown" || resolved.BeadsWorkDir != owner || !resolved.External {
+		t.Fatalf("resolved = %+v, want registered owner rig and external source", resolved)
+	}
+}
+
+func TestValidateMQSubmitTargetRejectsMalformedAndEqualSource(t *testing.T) {
+	for _, target := range []string{"", "bad..target", "bad target", "bad~target", "bad^target", "bad:target", "bad[target"} {
+		if err := validateMQSubmitTargetName(target); err == nil {
+			t.Errorf("validateMQSubmitTargetName(%q) = nil, want malformed-target error", target)
+		}
+	}
+	if err := validateMQSubmitSourceTarget("polecat/refuge/gt-source", "polecat/refuge/gt-source"); err == nil {
+		t.Fatal("validateMQSubmitSourceTarget() = nil, want source/target equality error")
+	}
+}
+
+func TestValidateMQSubmitTargetRejectsMissingRemoteBranch(t *testing.T) {
+	repo := t.TempDir()
+	remote := t.TempDir()
+	runGitForMQSubmitTest(t, remote, "init", "--bare")
+	runGitForMQSubmitTest(t, repo, "init")
+	runGitForMQSubmitTest(t, repo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, repo, "config", "user.name", "Test User")
+	runGitForMQSubmitTest(t, repo, "remote", "add", "origin", remote)
+	writeMQSubmitTestFile(t, repo, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, repo, "add", "file.txt")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, repo, "branch", "-M", "main")
+	runGitForMQSubmitTest(t, repo, "push", "-u", "origin", "main")
+
+	ownerGit := gitpkg.NewGit(repo)
+	if err := validateMQSubmitTarget(ownerGit, "main"); err != nil {
+		t.Fatalf("validateMQSubmitTarget(main) = %v, want nil", err)
+	}
+	if err := validateMQSubmitTarget(ownerGit, "missing-target"); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("validateMQSubmitTarget(missing-target) = %v, want missing-target error", err)
+	}
+}
+
+func TestValidateMQSubmitExistingMRRequiresExactRoutingDedup(t *testing.T) {
+	mr := &beads.Issue{
+		ID: "gt-mr",
+		Description: "branch: polecat/refuge/gt-source\n" +
+			"target: main\nsource_issue: gt-source\nrig: gastown\ncommit_sha: abc123\n",
+	}
+	if err := validateMQSubmitExistingMR(mr, "polecat/refuge/gt-source", "main", "gastown", "abc123"); err != nil {
+		t.Fatalf("validateMQSubmitExistingMR exact = %v, want nil", err)
+	}
+	for name, target := range map[string]string{"wrong target": "gte-00-rob", "missing target": ""} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateMQSubmitExistingMR(mr, "polecat/refuge/gt-source", target, "gastown", "abc123"); err == nil {
+				t.Fatalf("validateMQSubmitExistingMR target %q = nil, want exact-dedup rejection", target)
+			}
+		})
+	}
+}
+
+func TestGtE47ExternalWorktreeResolutionUsesRegisteredRig(t *testing.T) {
+	assertExternalMQSubmitOwner(t, "gt-e47", "gastown")
+}
+
+func TestPpo853ExternalWorktreeResolutionUsesOwnerRigBeads(t *testing.T) {
+	assertExternalMQSubmitOwner(t, "ppo-853", "pierpoint_ops")
+}
+
+func assertExternalMQSubmitOwner(t *testing.T, issueID, rigName string) {
+	t.Helper()
+	townRoot := t.TempDir()
+	outside := t.TempDir()
+	owner := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(owner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMQSubmitTownRegistry(t, townRoot, map[string]config.RigEntry{
+		rigName: {GitURL: "git@example.invalid/" + rigName + ".git", PushURL: "git@example.invalid/private/" + rigName + ".git"},
+	})
+	resolved, err := resolveMQSubmitRig(townRoot, outside, rigName)
+	if err != nil {
+		t.Fatalf("%s resolveMQSubmitRig: %v", issueID, err)
+	}
+	if resolved.RigName != rigName || resolved.BeadsWorkDir != owner || !resolved.External {
+		t.Fatalf("%s resolved = %+v, want owner rig %q and owner Beads path %q", issueID, resolved, rigName, owner)
+	}
+}
+
+func TestPpo4jkExplicitMainTargetOverridesConfiguredWrongTarget(t *testing.T) {
+	configuredDefault := "gte-00-rob"
+	explicitTarget := "main"
+	if got := mqSubmitExplicitTarget(explicitTarget, configuredDefault); got != "main" {
+		t.Fatalf("mqSubmitExplicitTarget(%q, %q) = %q, want main", explicitTarget, configuredDefault, got)
+	}
+}
+
+func writeMQSubmitTownRegistry(t *testing.T, townRoot string, entries map[string]config.RigEntry) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{\"name\":\"test-town\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs:    entries,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -150,6 +150,153 @@ func TestRunMqSubmitWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
 }
 
+func TestRunMqSubmitHostileRoutingFailuresDoNotCreateMR(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		wantInErr string
+	}{
+		{name: "malformed target", target: "bad target", wantInErr: "invalid target branch"},
+		{name: "missing target", target: "missing-target", wantInErr: "does not exist"},
+		{name: "source equals target", target: "feature/routed-submit", wantInErr: "cannot be the target branch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+			setupRoutedSubmitCommandTown(t, workDir)
+			branch := setupRoutedSubmitGitRepo(t, workDir, true)
+			logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+			resetMqSubmitFlagsForTest(t)
+			t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+			t.Setenv("GT_RIG", "")
+			t.Chdir(workDir)
+
+			mqSubmitBranch = branch
+			mqSubmitIssue = "bd-source"
+			mqSubmitTarget = tt.target
+			mqSubmitNoCleanup = true
+			err := runMqSubmit(nil, nil)
+			if err == nil || !strings.Contains(err.Error(), tt.wantInErr) {
+				t.Fatalf("runMqSubmit() error = %v, want %q", err, tt.wantInErr)
+			}
+			log := readSubmitSourceBDLog(t, logPath)
+			assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
+			assertBDLogNotContains(t, log, currentBeadsDir, "comments add")
+		})
+	}
+}
+
+func TestRunMqSubmitPpo4jkExplicitMainOverridesWrongConfiguredTarget(t *testing.T) {
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	townRoot := routedSourceTestTownRoot(workDir)
+	if err := os.WriteFile(filepath.Join(townRoot, "gastown", "config.json"), []byte(`{"type":"rig","name":"gastown","default_branch":"gte-00-rob"}
+`), 0o644); err != nil {
+		t.Fatalf("save wrong configured target: %v", err)
+	}
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Setenv("GT_RIG", "")
+	t.Chdir(workDir)
+
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitTarget = "main"
+	mqSubmitNoCleanup = true
+	if err := runMqSubmit(nil, nil); err != nil {
+		t.Fatalf("runMqSubmit explicit main: %v", err)
+	}
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, currentBeadsDir, "create --json")
+	if strings.Contains(log, "gte-00-rob") {
+		t.Fatalf("bd recorder saw stale configured target gte-00-rob:\n%s", log)
+	}
+}
+
+func TestRunMqSubmitExternalGitURLOnlyUsesRegisteredOwnerAuthority(t *testing.T) {
+	townRoot := t.TempDir()
+	ownerRepo := filepath.Join(townRoot, "gastown")
+	outsideRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write town sentinel: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(ownerRepo, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir owner beads: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir town beads: %v", err)
+	}
+	if err := beads.WriteRoutes(filepath.Join(townRoot, ".beads"), []beads.Route{{Prefix: "gt-", Path: "gastown"}}); err != nil {
+		t.Fatalf("write town routes: %v", err)
+	}
+
+	remote := t.TempDir()
+	runGitForMQSubmitTest(t, remote, "init", "--bare")
+	remoteURL := "file://" + filepath.ToSlash(remote)
+	runGitForMQSubmitTest(t, ownerRepo, "init")
+	runGitForMQSubmitTest(t, ownerRepo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, ownerRepo, "config", "user.name", "Test User")
+	runGitForMQSubmitTest(t, ownerRepo, "remote", "add", "origin", remoteURL)
+	writeMQSubmitTestFile(t, ownerRepo, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, ownerRepo, "add", "file.txt")
+	runGitForMQSubmitTest(t, ownerRepo, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, ownerRepo, "branch", "-M", "main")
+	runGitForMQSubmitTest(t, ownerRepo, "push", "-u", "origin", "main")
+
+	sourceRepo := filepath.Join(outsideRoot, "candidate")
+	runGitForMQSubmitTest(t, outsideRoot, "clone", remoteURL, sourceRepo)
+	runGitForMQSubmitTest(t, sourceRepo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, sourceRepo, "config", "user.name", "Test User")
+	branch := "feature/external-giturl"
+	runGitForMQSubmitTest(t, sourceRepo, "checkout", "-b", branch)
+	writeMQSubmitTestFile(t, sourceRepo, "file.txt", "external\n")
+	runGitForMQSubmitTest(t, sourceRepo, "commit", "-am", "external")
+	runGitForMQSubmitTest(t, sourceRepo, "push", "origin", branch)
+
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			// PushURL is intentionally empty: GitURL is the only registered
+			// authority and must be selected without reading rig/config.json.
+			"gastown": {GitURL: remoteURL},
+		},
+	}); err != nil {
+		t.Fatalf("save rigs config: %v", err)
+	}
+	currentBeadsDir := filepath.Join(outsideRoot, ".beads")
+	ownerBeadsDir := filepath.Join(ownerRepo, ".beads")
+	if err := os.MkdirAll(currentBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir current beads: %v", err)
+	}
+	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetMqSubmitFlagsForTest(t)
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_RIG", "")
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+	t.Chdir(sourceRepo)
+
+	mqSubmitRig = "gastown"
+	mqSubmitTarget = "main"
+	mqSubmitBranch = branch
+	mqSubmitIssue = "bd-source"
+	mqSubmitNoCleanup = true
+	mqSubmitSkipDeps = true
+	if err := runMqSubmit(nil, nil); err != nil {
+		t.Fatalf("external GitURL-only runMqSubmit: %v", err)
+	}
+
+	log := readSubmitSourceBDLog(t, logPath)
+	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
+	assertBDLogContains(t, log, ownerBeadsDir, "create --json")
+	assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
+}
+
 func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
 	setupRoutedSubmitCommandTown(t, workDir)
@@ -386,13 +533,16 @@ func assertBDLogNotContains(t *testing.T, log, beadsDir, args string) {
 func resetMqSubmitFlagsForTest(t *testing.T) {
 	t.Helper()
 	oldBranch, oldIssue, oldEpic := mqSubmitBranch, mqSubmitIssue, mqSubmitEpic
+	oldRig, oldTarget := mqSubmitRig, mqSubmitTarget
 	oldPriority := mqSubmitPriority
 	oldNoCleanup, oldSkipDeps, oldResubmit := mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit
 	mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = "", "", ""
+	mqSubmitRig, mqSubmitTarget = "", ""
 	mqSubmitPriority = -1
 	mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = false, false, false
 	t.Cleanup(func() {
 		mqSubmitBranch, mqSubmitIssue, mqSubmitEpic = oldBranch, oldIssue, oldEpic
+		mqSubmitRig, mqSubmitTarget = oldRig, oldTarget
 		mqSubmitPriority = oldPriority
 		mqSubmitNoCleanup, mqSubmitSkipDeps, mqSubmitResubmit = oldNoCleanup, oldSkipDeps, oldResubmit
 	})
