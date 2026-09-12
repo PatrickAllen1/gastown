@@ -540,6 +540,13 @@ func (m *Model) renderShortHelp() string {
 		HelpKeyStyle.Render("q") + HelpDescStyle.Render(":quit"),
 		HelpKeyStyle.Render("?") + HelpDescStyle.Render(":help"),
 	}
+	if m.focusedPanel == PanelConvoy {
+		verb := "show wrappers"
+		if m.showSystemWrappers {
+			verb = "hide wrappers"
+		}
+		hints = append(hints, HelpKeyStyle.Render("o")+HelpDescStyle.Render(":"+verb))
+	}
 	return strings.Join(hints, "  ")
 }
 

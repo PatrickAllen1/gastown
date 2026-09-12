@@ -84,10 +84,12 @@ type Model struct {
 	feedViewport   viewport.Model
 
 	// Data
-	rigs        map[string]*Rig
-	events      []Event
-	convoyState *ConvoyState
-	townRoot    string
+	rigs           map[string]*Rig
+	events         []Event
+	convoyState    *ConvoyState
+	convoyError    error
+	lastConvoyGood time.Time
+	townRoot       string
 
 	// UI state
 	keys     KeyMap
@@ -96,7 +98,8 @@ type Model struct {
 	filter   string
 
 	// View mode
-	viewMode ViewMode
+	viewMode           ViewMode
+	showSystemWrappers bool
 
 	// Problems view state
 	problemAgents     []*ProblemAgent
@@ -114,7 +117,7 @@ type Model struct {
 
 	// mu protects all fields read by View() from concurrent access:
 	// events, rigs, convoyState, eventChan, townRoot, width, height,
-	// focusedPanel, showHelp, help, filter, viewMode, problemAgents,
+	// focusedPanel, showHelp, help, filter, viewMode, showSystemWrappers, problemAgents,
 	// selectedProblem, selectedBeadID, problemsError, lastProblemsCheck,
 	// and all viewports. Write lock is held during Update/handleKey
 	// mutations; read lock is held during View/render.
@@ -181,6 +184,7 @@ type eventMsg Event
 // convoyUpdateMsg is sent when convoy data is refreshed
 type convoyUpdateMsg struct {
 	state *ConvoyState
+	err   error
 }
 
 // problemsUpdateMsg is sent when problems data is refreshed
@@ -238,8 +242,8 @@ func (m *Model) fetchConvoys() tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		state, _ := FetchConvoys(townRoot)
-		return convoyUpdateMsg{state: state}
+		state, err := FetchConvoys(townRoot)
+		return convoyUpdateMsg{state: state, err: err}
 	}
 }
 
@@ -289,10 +293,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.listenForEvents())
 
 	case convoyUpdateMsg:
-		if msg.state != nil {
+		if msg.err != nil {
+			// A failed refresh must retain the last good snapshot and remain
+			// visible as stale/error rather than becoming an empty 0/0 view.
+			m.mu.Lock()
+			m.convoyError = msg.err
+			m.updateViewContentLocked()
+			m.mu.Unlock()
+			cmds = append(cmds, m.convoyRefreshTick())
+		} else if msg.state != nil {
 			// Fresh data arrived - update state and schedule next tick
 			m.mu.Lock()
 			m.convoyState = msg.state
+			m.convoyError = nil
+			m.lastConvoyGood = msg.state.LastUpdate
 			m.updateViewContentLocked()
 			m.mu.Unlock()
 			cmds = append(cmds, m.convoyRefreshTick())
@@ -381,58 +395,85 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleTabKey()
 
 	case key.Matches(msg, m.keys.FocusTree):
+		m.mu.Lock()
 		if m.viewMode == ViewActivity {
-			m.mu.Lock()
 			m.focusedPanel = PanelTree
-			m.mu.Unlock()
 		}
+		m.mu.Unlock()
 		return m, nil
 
 	case key.Matches(msg, m.keys.FocusFeed):
+		m.mu.Lock()
 		if m.viewMode == ViewActivity {
-			m.mu.Lock()
 			m.focusedPanel = PanelFeed
-			m.mu.Unlock()
 		}
+		m.mu.Unlock()
 		return m, nil
 
 	case key.Matches(msg, m.keys.FocusConvoy):
+		m.mu.Lock()
 		if m.viewMode == ViewActivity {
-			m.mu.Lock()
 			m.focusedPanel = PanelConvoy
-			m.mu.Unlock()
 		}
+		m.mu.Unlock()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Expand):
+		m.mu.Lock()
+		if m.viewMode == ViewActivity && m.focusedPanel == PanelConvoy {
+			m.showSystemWrappers = !m.showSystemWrappers
+			m.updateViewContentLocked()
+		}
+		m.mu.Unlock()
 		return m, nil
 
 	case key.Matches(msg, m.keys.Refresh):
-		m.updateViewContent()
-		if m.viewMode == ViewProblems {
+		m.mu.Lock()
+		inProblems := m.viewMode == ViewProblems
+		m.updateViewContentLocked()
+		m.mu.Unlock()
+		if inProblems {
 			return m, m.fetchProblems()
 		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.Enter):
-		if m.viewMode == ViewProblems {
+		m.mu.RLock()
+		inProblems := m.viewMode == ViewProblems
+		m.mu.RUnlock()
+		if inProblems {
 			return m.attachToSelected()
 		}
 
 	case key.Matches(msg, m.keys.Nudge):
-		if m.viewMode == ViewProblems {
+		m.mu.RLock()
+		inProblems := m.viewMode == ViewProblems
+		m.mu.RUnlock()
+		if inProblems {
 			return m.nudgeSelected()
 		}
 
 	case key.Matches(msg, m.keys.Handoff):
-		if m.viewMode == ViewProblems {
+		m.mu.RLock()
+		inProblems := m.viewMode == ViewProblems
+		m.mu.RUnlock()
+		if inProblems {
 			return m.handoffSelected()
 		}
 
 	case key.Matches(msg, m.keys.Up):
-		if m.viewMode == ViewProblems {
+		m.mu.RLock()
+		inProblems := m.viewMode == ViewProblems
+		m.mu.RUnlock()
+		if inProblems {
 			return m.selectPrevProblem()
 		}
 
 	case key.Matches(msg, m.keys.Down):
-		if m.viewMode == ViewProblems {
+		m.mu.RLock()
+		inProblems := m.viewMode == ViewProblems
+		m.mu.RUnlock()
+		if inProblems {
 			return m.selectNextProblem()
 		}
 	}
@@ -478,7 +519,10 @@ func (m *Model) toggleProblemsView() (tea.Model, tea.Cmd) {
 
 // handleTabKey handles Tab key for panel/problem cycling
 func (m *Model) handleTabKey() (tea.Model, tea.Cmd) {
-	if m.viewMode == ViewProblems {
+	m.mu.RLock()
+	inProblems := m.viewMode == ViewProblems
+	m.mu.RUnlock()
+	if inProblems {
 		// In problems view, Tab cycles through problem agents
 		return m.selectNextProblem()
 	}

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -21,18 +20,29 @@ import (
 	"github.com/steveyegge/gastown/internal/util"
 )
 
-// convoyIDPattern validates convoy IDs.
-var convoyIDPattern = regexp.MustCompile(`^hq-[a-zA-Z0-9-]+$`)
-
 // Convoy represents a convoy's status for the dashboard
 type Convoy struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Status    string    `json:"status"`
-	Completed int       `json:"completed"`
-	Total     int       `json:"total"`
-	CreatedAt time.Time `json:"created_at"`
-	ClosedAt  time.Time `json:"closed_at,omitempty"`
+	ID         string               `json:"id"`
+	Title      string               `json:"title"`
+	Status     string               `json:"status"`
+	Completed  int                  `json:"completed"`
+	Total      int                  `json:"total"`
+	CreatedAt  time.Time            `json:"created_at"`
+	ClosedAt   time.Time            `json:"closed_at,omitempty"`
+	Tracked    []ConvoyTrackedIssue `json:"tracked"`
+	Owned      bool                 `json:"owned"`
+	OwnedKnown bool                 `json:"-"`
+	Lifecycle  string               `json:"lifecycle,omitempty"`
+	MetadataOK bool                 `json:"-"`
+}
+
+// ConvoyTrackedIssue is the native list command's routed child projection.
+// Status is intentionally retained so the dashboard can summarize hidden
+// system-managed wrappers without re-querying another beads database.
+type ConvoyTrackedIssue struct {
+	ID     string `json:"id"`
+	Title  string `json:"title,omitempty"`
+	Status string `json:"status"`
 }
 
 // MQEntry represents a single merge request in the merge queue
@@ -48,139 +58,24 @@ type MQEntry struct {
 type ConvoyState struct {
 	InProgress []Convoy
 	Landed     []Convoy
+	All        []Convoy
 	MQEntries  []MQEntry
 	LastUpdate time.Time
 }
 
 // FetchConvoys retrieves convoy status from town-level beads
 func FetchConvoys(townRoot string) (*ConvoyState, error) {
-	townBeads := filepath.Join(townRoot, ".beads")
+	return newNativeConvoySource(townRoot, nil).Fetch(context.Background())
+}
 
-	state := &ConvoyState{
-		InProgress: make([]Convoy, 0),
-		Landed:     make([]Convoy, 0),
-		LastUpdate: time.Now(),
-	}
-
-	// Fetch open convoys
-	openConvoys, err := listConvoys(townBeads, "open")
-	if err != nil {
-		// Not a fatal error - just return empty state
-		return state, nil
-	}
-
-	for _, c := range openConvoys {
-		// Get detailed status for each convoy
-		convoy := enrichConvoy(townBeads, c)
-		state.InProgress = append(state.InProgress, convoy)
-	}
-
-	// Fetch recently closed convoys (landed in last 24h)
-	closedConvoys, err := listConvoys(townBeads, "closed")
-	if err == nil {
-		cutoff := time.Now().Add(-24 * time.Hour)
-		for _, c := range closedConvoys {
-			convoy := enrichConvoy(townBeads, c)
-			if !convoy.ClosedAt.IsZero() && convoy.ClosedAt.After(cutoff) {
-				state.Landed = append(state.Landed, convoy)
-			}
-		}
-	}
-
-	// Sort: in-progress by created (oldest first), landed by closed (newest first)
-	sort.Slice(state.InProgress, func(i, j int) bool {
+func sortConvoyState(state *ConvoyState) {
+	// Keep all slices deterministic for a stable TUI and replayable tests.
+	sort.SliceStable(state.InProgress, func(i, j int) bool {
 		return state.InProgress[i].CreatedAt.Before(state.InProgress[j].CreatedAt)
 	})
-	sort.Slice(state.Landed, func(i, j int) bool {
+	sort.SliceStable(state.Landed, func(i, j int) bool {
 		return state.Landed[i].ClosedAt.After(state.Landed[j].ClosedAt)
 	})
-
-	// Fetch merge queue entries from all rigs
-	state.MQEntries = fetchMQEntries(townRoot)
-
-	return state, nil
-}
-
-// listConvoys returns convoys with the given status
-func listConvoys(beadsDir, status string) ([]convoyListItem, error) {
-	listArgs := []string{"list", "--status=" + status, "--json", "--limit=0"}
-
-	ctx, cancel := context.WithTimeout(context.Background(), constants.BdSubprocessTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "bd", listArgs...) //nolint:gosec // G204: args are constructed internally
-	util.SetDetachedProcessGroup(cmd)
-	cmd.Dir = beadsDir
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-
-	if err := cmd.Run(); err != nil {
-		return nil, err
-	}
-
-	var rawItems []convoyListItem
-	if err := json.Unmarshal(stdout.Bytes(), &rawItems); err != nil {
-		return nil, err
-	}
-
-	items := make([]convoyListItem, 0, len(rawItems))
-	for _, item := range rawItems {
-		if item.IssueType == "convoy" || feedConvoyHasLabel(item.Labels, "gt:convoy") {
-			items = append(items, item)
-		}
-	}
-	return items, nil
-}
-
-type convoyListItem struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	Status    string   `json:"status"`
-	CreatedAt string   `json:"created_at"`
-	ClosedAt  string   `json:"closed_at,omitempty"`
-	IssueType string   `json:"issue_type"`
-	Labels    []string `json:"labels"`
-}
-
-func feedConvoyHasLabel(labels []string, target string) bool {
-	for _, label := range labels {
-		if label == target {
-			return true
-		}
-	}
-	return false
-}
-
-// enrichConvoy adds tracked issue counts to a convoy
-func enrichConvoy(beadsDir string, item convoyListItem) Convoy {
-	convoy := Convoy{
-		ID:     item.ID,
-		Title:  item.Title,
-		Status: item.Status,
-	}
-
-	// Parse timestamps
-	if t, err := time.Parse(time.RFC3339, item.CreatedAt); err == nil {
-		convoy.CreatedAt = t
-	} else if t, err := time.Parse("2006-01-02 15:04", item.CreatedAt); err == nil {
-		convoy.CreatedAt = t
-	}
-	if t, err := time.Parse(time.RFC3339, item.ClosedAt); err == nil {
-		convoy.ClosedAt = t
-	} else if t, err := time.Parse("2006-01-02 15:04", item.ClosedAt); err == nil {
-		convoy.ClosedAt = t
-	}
-
-	// Get tracked issues and their status
-	tracked := getTrackedIssueStatus(beadsDir, item.ID)
-	convoy.Total = len(tracked)
-	for _, t := range tracked {
-		if t.Status == "closed" {
-			convoy.Completed++
-		}
-	}
-
-	return convoy
 }
 
 // Convoy panel styles
@@ -232,31 +127,93 @@ func (m *Model) renderConvoyPanel() string {
 // Caller must hold m.mu.
 func (m *Model) renderConvoys() string {
 	if m.convoyState == nil {
+		if m.convoyError != nil {
+			return EventFailStyle.Render("Convoy refresh error: " + m.convoyError.Error())
+		}
 		return AgentIdleStyle.Render("Loading convoys...")
 	}
 
 	var lines []string
+	inProgressWrappers := systemWrapperSummary(m.convoyState.InProgress)
+	landedWrappers := systemWrapperSummary(m.convoyState.Landed)
 
 	// In Progress section
 	lines = append(lines, ConvoySectionStyle.Render("IN PROGRESS"))
-	if len(m.convoyState.InProgress) == 0 {
-		lines = append(lines, "  "+AgentIdleStyle.Render("No active convoys"))
-	} else {
-		for _, c := range m.convoyState.InProgress {
-			lines = append(lines, renderConvoyLine(c, false))
+	if m.showSystemWrappers {
+		if len(m.convoyState.InProgress) == 0 {
+			lines = append(lines, "  "+AgentIdleStyle.Render("No active convoys"))
+		} else {
+			for _, c := range m.convoyState.InProgress {
+				lines = appendConvoyRender(lines, c, false, true)
+			}
 		}
+	} else {
+		normal := make([]Convoy, 0, len(m.convoyState.InProgress))
+		for _, c := range m.convoyState.InProgress {
+			if !isVerifiedSystemWrapper(c) {
+				normal = append(normal, c)
+			}
+		}
+		if len(normal) == 0 {
+			lines = append(lines, "  "+AgentIdleStyle.Render("No active convoys"))
+		} else {
+			for _, c := range normal {
+				lines = appendConvoyRender(lines, c, false, false)
+			}
+		}
+		if inProgressWrappers.count > 0 {
+			lines = append(lines, "  "+renderSystemWrapperSummary(inProgressWrappers))
+		}
+	}
+
+	if m.convoyError != nil {
+		stale := "STALE convoy data: " + m.convoyError.Error()
+		if !m.lastConvoyGood.IsZero() {
+			stale += " (last good " + formatAge(time.Since(m.lastConvoyGood)) + " ago)"
+		}
+		lines = append(lines, "  "+EventFailStyle.Render(stale))
 	}
 
 	lines = append(lines, "")
 
 	// Recently Landed section
 	lines = append(lines, ConvoySectionStyle.Render("RECENTLY LANDED (24h)"))
-	if len(m.convoyState.Landed) == 0 {
-		lines = append(lines, "  "+AgentIdleStyle.Render("No recent landings"))
-	} else {
-		for _, c := range m.convoyState.Landed {
-			lines = append(lines, renderConvoyLine(c, true))
+	if m.showSystemWrappers {
+		if len(m.convoyState.Landed) == 0 {
+			lines = append(lines, "  "+AgentIdleStyle.Render("No recent landings"))
+		} else {
+			for _, c := range m.convoyState.Landed {
+				lines = appendConvoyRender(lines, c, true, true)
+			}
 		}
+	} else {
+		normal := make([]Convoy, 0, len(m.convoyState.Landed))
+		for _, c := range m.convoyState.Landed {
+			if !isVerifiedSystemWrapper(c) {
+				normal = append(normal, c)
+			}
+		}
+		if len(normal) == 0 {
+			lines = append(lines, "  "+AgentIdleStyle.Render("No recent landings"))
+		} else {
+			for _, c := range normal {
+				lines = appendConvoyRender(lines, c, true, false)
+			}
+		}
+		if landedWrappers.count > 0 {
+			lines = append(lines, "  "+renderSystemWrapperSummary(landedWrappers))
+		}
+	}
+
+	// Toggle help is context-sensitive and remains visible in the short help
+	// bar when the convoy panel has focus.
+	lines = append(lines, "")
+	if m.focusedPanel == PanelConvoy {
+		verb := "show wrappers"
+		if m.showSystemWrappers {
+			verb = "hide wrappers"
+		}
+		lines = append(lines, ConvoyAgeStyle.Render("  o: "+verb))
 	}
 
 	// Merge Queue section
@@ -273,6 +230,57 @@ func (m *Model) renderConvoys() string {
 	return strings.Join(lines, "\n")
 }
 
+func appendConvoyRender(lines []string, convoy Convoy, landed, detail bool) []string {
+	lines = append(lines, renderConvoyLine(convoy, landed))
+	if detail && isVerifiedSystemWrapper(convoy) {
+		for _, tracked := range convoy.Tracked {
+			lines = append(lines, fmt.Sprintf("    ↳ %s [%s]", tracked.ID, tracked.Status))
+		}
+	}
+	return lines
+}
+
+func isVerifiedSystemWrapper(convoy Convoy) bool {
+	return convoy.MetadataOK && convoy.OwnedKnown && !convoy.Owned &&
+		convoy.Lifecycle == "system-managed" && convoy.Total == 1 && len(convoy.Tracked) == 1
+}
+
+type systemWrapperTotals struct {
+	count     int
+	completed int
+	total     int
+	statuses  map[string]int
+}
+
+func systemWrapperSummary(rows []Convoy) systemWrapperTotals {
+	totals := systemWrapperTotals{statuses: make(map[string]int)}
+	for _, convoy := range rows {
+		if !isVerifiedSystemWrapper(convoy) {
+			continue
+		}
+		totals.count++
+		totals.completed += convoy.Completed
+		totals.total += convoy.Total
+		for _, tracked := range convoy.Tracked {
+			totals.statuses[tracked.Status]++
+		}
+	}
+	return totals
+}
+
+func renderSystemWrapperSummary(totals systemWrapperTotals) string {
+	statuses := make([]string, 0, len(totals.statuses))
+	for status := range totals.statuses {
+		statuses = append(statuses, status)
+	}
+	sort.Strings(statuses)
+	parts := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		parts = append(parts, fmt.Sprintf("%s:%d", status, totals.statuses[status]))
+	}
+	return fmt.Sprintf("SYSTEM TASKS (%d hidden) %d/%d complete [%s]", totals.count, totals.completed, totals.total, strings.Join(parts, " "))
+}
+
 // renderConvoyLine renders a single convoy status line
 func renderConvoyLine(c Convoy, landed bool) string {
 	// Format: "  hq-xyz  Title       2/4 ●●○○" or "  hq-xyz  Title       ✓ 2h ago"
@@ -285,6 +293,9 @@ func renderConvoyLine(c Convoy, landed bool) string {
 		title = string(runes[:17]) + "..."
 	}
 	title = ConvoyNameStyle.Render(title)
+	if !c.MetadataOK {
+		title += " " + EventFailStyle.Render("[metadata unknown]")
+	}
 
 	if landed {
 		// Show checkmark and time since landing
@@ -292,7 +303,6 @@ func renderConvoyLine(c Convoy, landed bool) string {
 		status := ConvoyLandedStyle.Render("✓") + " " + ConvoyAgeStyle.Render(age+" ago")
 		return fmt.Sprintf("  %s  %-20s  %s", id, title, status)
 	}
-
 	// Show progress bar
 	progress := renderProgressBar(c.Completed, c.Total)
 	count := ConvoyProgressStyle.Render(fmt.Sprintf("%d/%d", c.Completed, c.Total))
