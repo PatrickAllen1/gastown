@@ -1818,6 +1818,24 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 		return nil, fmt.Errorf("%w: %s", ErrPolecatNeedsRecovery, decision.Reason)
 	}
 
+	// ResetAgentBeadForReuse intentionally preserves a durable profile, but the
+	// subsequent create-or-reopen update receives the fields supplied here. Read
+	// the existing profile before that reset so a retry without an override does
+	// not silently revert to (or erase) the rig default.
+	agentID := m.agentBeadID(name)
+	agentProfile := opts.AgentProfile
+	if agentProfile == "" {
+		_, fields, profileErr := m.agentBeads().GetAgentBead(agentID)
+		if profileErr == nil && fields != nil {
+			agentProfile = fields.AgentProfile
+		} else if profileErr != nil && !errors.Is(profileErr, beads.ErrNotInstalled) && !strings.Contains(profileErr.Error(), "does not exist") {
+			return nil, fmt.Errorf("reading durable agent profile for %s: %w", name, profileErr)
+		}
+	}
+	if _, err := m.resolveRuntimeConfig(agentProfile); err != nil {
+		return nil, err
+	}
+
 	// Get worktree path (must already exist for reuse)
 	clonePath := m.clonePath(name)
 	if _, err := os.Stat(clonePath); err != nil {
@@ -1937,7 +1955,6 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	}
 
 	// Reset agent bead for reuse
-	agentID := m.agentBeadID(name)
 	if err := m.resetAgentBeadForReuse(agentID, "idle polecat reuse"); err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
 			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
@@ -1949,7 +1966,7 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 		RoleType:     "polecat",
 		Rig:          m.rig.Name,
 		AgentState:   "spawning",
-		AgentProfile: opts.AgentProfile,
+		AgentProfile: agentProfile,
 		HookBead:     opts.HookBead,
 	}); err != nil {
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
