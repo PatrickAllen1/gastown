@@ -147,6 +147,21 @@ type Manager struct {
 	townRoot string // Computed once at construction; used by agentBeadID for deterministic IDs
 }
 
+var hasPolecatSessionFn = func(t *tmux.Tmux, sessionName string) (bool, error) {
+	return t.HasSession(sessionName)
+}
+
+func probePolecatSession(t *tmux.Tmux, sessionName string) (bool, error) {
+	if t == nil {
+		return false, nil
+	}
+	running, err := hasPolecatSessionFn(t, sessionName)
+	if err != nil && !errors.Is(err, tmux.ErrSessionNotFound) && !errors.Is(err, tmux.ErrNoServer) {
+		return false, fmt.Errorf("checking polecat session %s: %w", sessionName, err)
+	}
+	return running, nil
+}
+
 // NewManager creates a new polecat manager.
 func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
 	// Use the resolved beads directory to find where bd commands should run.
@@ -362,6 +377,95 @@ func (m *Manager) resetAgentBeadForReuse(agentID, reason string) error {
 	return m.agentBeads().ResetAgentBeadForReuse(agentID, reason)
 }
 
+// resolveRuntimeConfig validates an explicit runtime/profile override before
+// any polecat filesystem or identity mutation. Empty profiles retain the
+// configured polecat default.
+func (m *Manager) resolveRuntimeConfig(agentProfile string) (*config.RuntimeConfig, error) {
+	if agentProfile == "" {
+		return config.ResolveRoleAgentConfig("polecat", m.townRoot, m.rig.Path), nil
+	}
+	rc, _, err := config.ResolveAgentConfigWithOverride(m.townRoot, m.rig.Path, agentProfile)
+	if err != nil {
+		return nil, fmt.Errorf("resolving agent config for %s: %w", agentProfile, err)
+	}
+	return rc, nil
+}
+
+// parseDurableAgentProfile reads the profile extension without requiring a
+// wider beads schema change. Older identity descriptions may carry this field
+// even though their typed parser does not know it yet.
+func parseDurableAgentProfile(description string) string {
+	for _, line := range strings.Split(description, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "agent_profile", "agent-profile", "agentprofile":
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func setDurableAgentProfile(description, profile string) string {
+	lines := strings.Split(description, "\n")
+	for i, line := range lines {
+		key, _, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "agent_profile", "agent-profile", "agentprofile":
+			lines[i] = "agent_profile: " + profile
+			return strings.Join(lines, "\n")
+		}
+	}
+	insertAt := len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "hook_bead:") {
+			insertAt = i
+			break
+		}
+	}
+	lines = append(lines, "")
+	copy(lines[insertAt+1:], lines[insertAt:len(lines)-1])
+	lines[insertAt] = "agent_profile: " + profile
+	return strings.Join(lines, "\n")
+}
+
+func (m *Manager) durableAgentProfile(name string) (string, error) {
+	issue, _, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "does not exist") {
+			return "", nil
+		}
+		return "", err
+	}
+	if issue == nil {
+		return "", nil
+	}
+	return parseDurableAgentProfile(issue.Description), nil
+}
+
+func (m *Manager) persistDurableAgentProfile(name, profile string) error {
+	if profile == "" {
+		return nil
+	}
+	issue, _, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "does not exist") {
+			return nil
+		}
+		return err
+	}
+	if issue == nil {
+		return nil
+	}
+	description := setDurableAgentProfile(issue.Description, profile)
+	return m.agentBeads().Update(m.agentBeadID(name), beads.UpdateOptions{Description: &description})
+}
+
 // SetAgentStateWithRetry wraps SetAgentState with retry logic.
 // Returns an error after exhausting retries, but callers may choose to warn
 // rather than fail — e.g., in StartSession where the tmux session is already
@@ -531,8 +635,9 @@ func (m *Manager) exists(name string) bool {
 
 // AddOptions configures polecat creation.
 type AddOptions struct {
-	HookBead   string // Bead ID to set as hook_bead at spawn time (atomic assignment)
-	BaseBranch string // Override base branch for worktree (e.g., "origin/integration/gt-epic")
+	HookBead     string // Bead ID to set as hook_bead at spawn time (atomic assignment)
+	AgentProfile string // Requested runtime/profile override for this polecat session
+	BaseBranch   string // Override base branch for worktree (e.g., "origin/integration/gt-epic")
 	// ResumeBranch reuses an existing branch (typically a PR head) for the polecat
 	// worktree instead of creating a fresh polecat/<name>/<bead>+<ts> branch (gh#3602).
 	// When set, the polecat's branch IS this branch — pushes go back to the same ref,
@@ -660,6 +765,10 @@ func (m *Manager) Add(name string) (*Polecat, error) {
 // (GH#2215) by holding the pool lock through directory creation, ensuring
 // no concurrent process can allocate the same name.
 func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
+	if _, err := m.resolveRuntimeConfig(opts.AgentProfile); err != nil {
+		return "", nil, err
+	}
+
 	// Hold pool lock across allocation + directory creation to close the
 	// race window where a concurrent AllocateName could miss the pending
 	// marker and reallocate the same name.
@@ -724,6 +833,10 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 // Caller MUST hold the polecat lock and have already created polecatDir.
 func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir string) (_ *Polecat, retErr error) {
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
+	runtimeConfig, err := m.resolveRuntimeConfig(opts.AgentProfile)
+	if err != nil {
+		return nil, err
+	}
 
 	// Pre-check: Verify sufficient disk space before expensive worktree creation.
 	if level, msg, err := util.CheckDiskSpace(m.rig.Path); err == nil && level == util.DiskSpaceCritical {
@@ -832,8 +945,6 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		style.PrintWarning("could not update local git excludes: %v", err)
 	}
 
-	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(polecatSettingsDir, clonePath, "polecat", runtimeConfig); err != nil {
 		style.PrintWarning("could not install runtime settings: %v", err)
@@ -856,6 +967,10 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 	}); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
+	}
+	if err := m.persistDurableAgentProfile(name, opts.AgentProfile); err != nil {
+		cleanupOnError()
+		return nil, fmt.Errorf("persisting agent profile for %s: %w", name, err)
 	}
 
 	now := time.Now()
@@ -886,6 +1001,10 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 
 	if m.exists(name) {
 		return nil, ErrPolecatExists
+	}
+	runtimeConfig, err := m.resolveRuntimeConfig(opts.AgentProfile)
+	if err != nil {
+		return nil, err
 	}
 
 	// Pre-check: Verify sufficient disk space before creating worktree.
@@ -1054,8 +1173,6 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 
 	// Install runtime settings in the shared polecats parent directory.
 	// Settings are passed to Claude Code via --settings flag.
-	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(polecatSettingsDir, clonePath, "polecat", runtimeConfig); err != nil {
 		// Non-fatal - log warning but continue
@@ -1091,6 +1208,10 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 		// Hard fail — an untrackable polecat is worse than no polecat
 		cleanupOnError()
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
+	}
+	if err := m.persistDurableAgentProfile(name, opts.AgentProfile); err != nil {
+		cleanupOnError()
+		return nil, fmt.Errorf("persisting agent profile for %s: %w", name, err)
 	}
 
 	// Return polecat with working state (transient model: polecats are spawned with work)
@@ -1755,6 +1876,12 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 //  4. Reset agent bead and set hook_bead atomically
 //  5. Return polecat in working state
 func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, error) {
+	if m.tmux != nil {
+		sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+		if _, err := probePolecatSession(m.tmux, sessionName); err != nil {
+			return nil, err
+		}
+	}
 	// Acquire per-polecat file lock to prevent concurrent reuse/remove races
 	fl, err := m.lockPolecat(name)
 	if err != nil {
@@ -1785,6 +1912,21 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	}
 	if decision := m.reuseDecisionForPolecat(name, current.State); !decision.Reusable {
 		return nil, fmt.Errorf("%w: %s", ErrPolecatNeedsRecovery, decision.Reason)
+	}
+
+	// Capture the durable profile before ResetAgentBeadForReuse rewrites the
+	// description. An empty request means "retain the identity profile".
+	agentID := m.agentBeadID(name)
+	agentProfile := strings.TrimSpace(opts.AgentProfile)
+	if agentProfile == "" {
+		profile, profileErr := m.durableAgentProfile(name)
+		if profileErr != nil {
+			return nil, fmt.Errorf("reading durable agent profile for %s: %w", name, profileErr)
+		}
+		agentProfile = profile
+	}
+	if _, err := m.resolveRuntimeConfig(agentProfile); err != nil {
+		return nil, err
 	}
 
 	// Get worktree path (must already exist for reuse)
@@ -1906,7 +2048,6 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	}
 
 	// Reset agent bead for reuse
-	agentID := m.agentBeadID(name)
 	if err := m.resetAgentBeadForReuse(agentID, "idle polecat reuse"); err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
 			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
@@ -1932,6 +2073,9 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	if err := m.agentBeads().UpdateAgentState(agentID, "spawning"); err != nil {
 		style.PrintWarning("could not sync agent_state column to spawning: %v", err)
 	}
+	if err := m.persistDurableAgentProfile(name, agentProfile); err != nil {
+		return nil, fmt.Errorf("persisting agent profile for %s: %w", name, err)
+	}
 
 	now := time.Now()
 	return &Polecat{
@@ -1954,8 +2098,11 @@ func (m *Manager) killExistingPolecatSession(name, action string) error {
 	}
 
 	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
-	running, err := m.tmux.HasSession(sessionName)
-	if err != nil || !running {
+	running, err := probePolecatSession(m.tmux, sessionName)
+	if err != nil {
+		return fmt.Errorf("checking existing session %s for %s: %w", sessionName, action, err)
+	}
+	if !running {
 		return nil
 	}
 	if err := m.tmux.KillSessionWithProcesses(sessionName); err != nil {
@@ -2570,6 +2717,12 @@ func (m *Manager) SetAgentState(name string, state string) error {
 	return m.agentBeads().UpdateAgentState(agentID, state)
 }
 
+// AgentProfile returns the durable runtime/profile override for a polecat.
+// Missing identity beads and empty profiles both mean the configured default.
+func (m *Manager) AgentProfile(name string) (string, error) {
+	return m.durableAgentProfile(name)
+}
+
 // - StateDone: assignee cleared from issue (polecat ready for cleanup)
 // - StateStuck: issue status set to blocked (if supported)
 // If beads is not available, this is a no-op.
@@ -2862,7 +3015,7 @@ func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	}
 
 	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
-	running, err := m.tmux.HasSession(sessionName)
+	running, err := probePolecatSession(m.tmux, sessionName)
 	if err != nil || !running {
 		return false, false
 	}
