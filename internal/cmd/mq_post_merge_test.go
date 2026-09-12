@@ -34,12 +34,20 @@ func (m *fakeMQPostMergeManager) PostMergeMR(mr *refinery.MergeRequest) (*refine
 }
 
 type fakeMQPostMergeGit struct {
-	verifyErr error
-	openPR    bool
-	deleteErr error
-	remoteTip string
-	localHead string
-	tipErr    error
+	verifyErr    error
+	verifyErrs   map[string]error
+	openPR       bool
+	deleteErr    error
+	remoteTip    string
+	localHead    string
+	tipErr       error
+	patchErr     error
+	patchSource  string
+	patchTarget  string
+	patchCommit  string
+	lookupErr    error
+	lookupRef    git.PullRequestRef
+	lookupResult *git.PullRequestInfo
 
 	verifiedCommits []string
 	deletedBranches []string
@@ -49,7 +57,25 @@ type fakeMQPostMergeGit struct {
 
 func (g *fakeMQPostMergeGit) VerifyPushedCommitReachableFromPushTarget(_, _, commit string) error {
 	g.verifiedCommits = append(g.verifiedCommits, commit)
+	if err, ok := g.verifyErrs[commit]; ok {
+		return err
+	}
 	return g.verifyErr
+}
+
+func (g *fakeMQPostMergeGit) VerifyPushedCommitPatchEquivalentFromPushTarget(_, sourceBranch, targetBranch, commit string) error {
+	g.patchSource = sourceBranch
+	g.patchTarget = targetBranch
+	g.patchCommit = commit
+	return g.patchErr
+}
+
+func (g *fakeMQPostMergeGit) LookupPullRequest(ref git.PullRequestRef) (*git.PullRequestInfo, error) {
+	g.lookupRef = ref
+	if g.lookupErr != nil {
+		return nil, g.lookupErr
+	}
+	return g.lookupResult, nil
 }
 
 func (g *fakeMQPostMergeGit) HasOpenPullRequest(git.PullRequestRef) bool {
@@ -88,7 +114,10 @@ func testMQPostMergeMR() *refinery.MergeRequest {
 
 func TestRunVerifiedMQPostMerge_ProofFailurePreservesRecordsAndBranch(t *testing.T) {
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
-	rigGit := &fakeMQPostMergeGit{verifyErr: errors.New("not reachable")}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErr: errors.New("not reachable"),
+		patchErr:  errors.New("not preserved"),
+	}
 
 	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "merge proof failed") {
@@ -255,5 +284,114 @@ func TestRunVerifiedMQPostMerge_SourceTargetBranchFailsClosed(t *testing.T) {
 	}
 	if len(rigGit.deletedBranches) != 0 {
 		t.Fatalf("branch deleted when source matched target: %v", rigGit.deletedBranches)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_AcceptsAuthenticatedPatchTransplant(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.MergeCommit = "landing987"
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		remoteTip:  mr.CommitSHA,
+		localHead:  mr.CommitSHA,
+	}
+
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	if err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if !mgr.postMergeCalled {
+		t.Fatal("PostMerge was not called after authenticated patch-transplant proof")
+	}
+	if len(rigGit.verifiedCommits) != 2 || rigGit.verifiedCommits[0] != mr.CommitSHA || rigGit.verifiedCommits[1] != mr.MergeCommit {
+		t.Fatalf("verified commits = %v, want [%s %s]", rigGit.verifiedCommits, mr.CommitSHA, mr.MergeCommit)
+	}
+	if rigGit.patchSource != mr.Branch || rigGit.patchTarget != mr.TargetBranch || rigGit.patchCommit != mr.CommitSHA {
+		t.Fatalf("patch proof = source %q target %q commit %q, want %q %q %q", rigGit.patchSource, rigGit.patchTarget, rigGit.patchCommit, mr.Branch, mr.TargetBranch, mr.CommitSHA)
+	}
+	if !cleanup.RemoteDeleted || !cleanup.LocalDeleted {
+		t.Fatalf("cleanup = %+v, want lease-safe branch deletion", cleanup)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_SourceBoundProofDoesNotRequireLandingField(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		remoteTip:  mr.CommitSHA,
+		localHead:  mr.CommitSHA,
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, true)
+	if err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if !mgr.postMergeCalled {
+		t.Fatal("PostMerge was not called after source-bound patch proof")
+	}
+	if len(rigGit.verifiedCommits) != 1 || rigGit.verifiedCommits[0] != mr.CommitSHA {
+		t.Fatalf("verified commits = %v, want [%s]", rigGit.verifiedCommits, mr.CommitSHA)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_PatchTransplantDivergenceFailsClosed(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.MergeCommit = "landing987"
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		patchErr:   errors.New("submitted patch is not preserved"),
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "merge proof failed") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want merge proof failure", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("PostMerge called for divergent patch transplant")
+	}
+	if len(rigGit.deletedBranches) != 0 || len(rigGit.localDeleted) != 0 {
+		t.Fatalf("branch deleted after failed patch proof: remote=%v local=%v", rigGit.deletedBranches, rigGit.localDeleted)
+	}
+}
+
+func TestRunVerifiedMQPostMerge_AcceptsRecordedMergedPRLanding(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.PRURL = "https://github.com/upstream/repo/pull/42"
+	mr.PRNumber = 42
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		patchErr:   errors.New("patch proof not used"),
+		lookupResult: &git.PullRequestInfo{
+			Number:         mr.PRNumber,
+			URL:            mr.PRURL,
+			State:          "MERGED",
+			HeadRefName:    mr.Branch,
+			HeadSHA:        mr.CommitSHA,
+			BaseRefName:    mr.TargetBranch,
+			MergeCommitSHA: "landing987",
+		},
+		remoteTip: mr.CommitSHA,
+		localHead: mr.CommitSHA,
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, true)
+	if err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if !mgr.postMergeCalled {
+		t.Fatal("PostMerge was not called after recorded merged PR proof")
+	}
+	if mr.MergeCommit != "landing987" {
+		t.Fatalf("MR merge commit = %q, want provider landing", mr.MergeCommit)
+	}
+	if rigGit.lookupRef.URL != mr.PRURL || rigGit.lookupRef.Number != mr.PRNumber || rigGit.lookupRef.HeadSHA != mr.CommitSHA {
+		t.Fatalf("PR lookup ref = %+v, want recorded identity and submitted head", rigGit.lookupRef)
+	}
+	if len(rigGit.verifiedCommits) != 2 || rigGit.verifiedCommits[1] != "landing987" {
+		t.Fatalf("verified commits = %v, want candidate and provider landing", rigGit.verifiedCommits)
 	}
 }

@@ -14,7 +14,7 @@ case "$*" in
   *baseRepository*) printf 'unsupported field requested: %s\n' "$*" >&2; exit 2 ;;
 esac
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "https://github.com/upstream/repo/pull/42" ]; then
-  printf '%s\n' '{"number":42,"url":"https://github.com/upstream/repo/pull/42","state":"MERGED","mergedAt":"2026-07-13T12:00:00Z","headRefName":"fix/deleted-head","headRefOid":"abc123","headRepository":null,"headRepositoryOwner":{"login":"fork-owner"},"baseRepository":{"nameWithOwner":"upstream/repo"}}'
+  printf '%s\n' '{"number":42,"url":"https://github.com/upstream/repo/pull/42","state":"MERGED","mergedAt":"2026-07-13T12:00:00Z","headRefName":"fix/deleted-head","headRefOid":"abc123","headRepository":null,"headRepositoryOwner":{"login":"fork-owner"},"baseRefName":"main","baseRepository":{"nameWithOwner":"upstream/repo"},"mergeCommit":{"oid":"landing987"}}'
   exit 0
 fi
 printf 'unexpected gh args: %s\n' "$*" >&2
@@ -28,7 +28,7 @@ exit 1
 	if err != nil {
 		t.Fatalf("LookupPullRequest: %v", err)
 	}
-	if !pr.Merged() || pr.Number != 42 || pr.HeadOwner != "fork-owner" {
+	if !pr.Merged() || pr.Number != 42 || pr.HeadOwner != "fork-owner" || pr.BaseRefName != "main" || pr.MergeCommitSHA != "landing987" {
 		t.Fatalf("unexpected PR: %+v", pr)
 	}
 	if pr.LookupSource != "recorded-url" {

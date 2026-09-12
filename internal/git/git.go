@@ -2143,6 +2143,62 @@ func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit s
 	return nil
 }
 
+// VerifyPushedCommitPatchEquivalentFromPushTarget verifies that an exact
+// submitted source branch tip is represented on the target, even when the
+// target does not contain the source commit by ancestry. The source branch is
+// fetched from the push target and must still point at commit before its
+// exact tree preservation is checked. This keeps patch-transplant proof bound
+// to the submitted MR instead of accepting an unrelated local commit or a
+// patch-id-only match with different content.
+func (g *Git) VerifyPushedCommitPatchEquivalentFromPushTarget(remote, sourceBranch, targetBranch, commit string) error {
+	remote = strings.TrimSpace(remote)
+	sourceBranch = strings.TrimSpace(sourceBranch)
+	targetBranch = strings.TrimSpace(targetBranch)
+	commit = strings.TrimSpace(commit)
+	if remote == "" || sourceBranch == "" || targetBranch == "" || commit == "" {
+		return fmt.Errorf("verified_patch_failed: missing remote, source branch, target branch, or commit")
+	}
+
+	sourceTip, err := g.PushRemoteBranchTip(remote, sourceBranch)
+	if err != nil {
+		return fmt.Errorf("verified_patch_failed: unable to read %s/%s: %w", remote, sourceBranch, err)
+	}
+	if sourceTip == "" {
+		return fmt.Errorf("verified_patch_failed: source branch %s/%s is missing (expected %s)", remote, sourceBranch, shortSHA(commit))
+	}
+	if strings.TrimSpace(sourceTip) != commit {
+		return fmt.Errorf("verified_patch_failed: source branch %s/%s changed from submitted %s to %s", remote, sourceBranch, shortSHA(commit), shortSHA(sourceTip))
+	}
+
+	fetchTarget := g.pushTarget(remote)
+	sourceRef := "refs/heads/" + sourceBranch
+	if _, err := g.run("fetch", "--no-tags", fetchTarget, sourceRef); err != nil {
+		return fmt.Errorf("verified_patch_failed: unable to fetch %s/%s: %w", remote, sourceBranch, err)
+	}
+	fetchedSource, err := g.Rev("FETCH_HEAD")
+	if err != nil {
+		return fmt.Errorf("verified_patch_failed: unable to resolve fetched source %s/%s: %w", remote, sourceBranch, err)
+	}
+	if strings.TrimSpace(fetchedSource) != commit {
+		return fmt.Errorf("verified_patch_failed: source branch %s/%s changed while verifying: expected %s, fetched %s", remote, sourceBranch, shortSHA(commit), shortSHA(fetchedSource))
+	}
+
+	targetRef := "refs/remotes/" + remote + "/" + targetBranch
+	targetRefspec := "refs/heads/" + targetBranch + ":" + targetRef
+	if _, err := g.run("fetch", "--no-tags", fetchTarget, targetRefspec); err != nil {
+		return fmt.Errorf("verified_patch_failed: unable to fetch %s/%s: %w", remote, targetBranch, err)
+	}
+
+	status, err := g.preservationOfRefAgainstRef(commit, targetRef)
+	if err != nil {
+		return fmt.Errorf("verified_patch_failed: unable to compare submitted %s with %s/%s: %w", shortSHA(commit), remote, targetBranch, err)
+	}
+	if !status.Preserved || (status.Evidence != "ancestor" && status.Evidence != "merge_tree_noop") {
+		return fmt.Errorf("verified_patch_failed: submitted %s is not preserved on %s/%s", shortSHA(commit), remote, targetBranch)
+	}
+	return nil
+}
+
 func parseLSRemoteTip(out, branch string) string {
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		line = strings.TrimSpace(line)

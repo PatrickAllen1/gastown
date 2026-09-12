@@ -174,7 +174,7 @@ var mqPostMergeCmd = &cobra.Command{
 	Long: `Perform post-merge cleanup after a successful merge.
 
 This command consolidates post-merge steps into a single atomic operation:
-	 1. Verify the target branch contains the submitted source head
+	 1. Verify the target branch contains the submitted source head (or an authenticated landing proof)
 	 2. Close the MR bead (status: merged)
 	 3. Close the source issue
 	 4. Delete the remote polecat branch at the submitted head (unless --skip-branch-delete)
@@ -201,6 +201,21 @@ type mqPostMergeGit interface {
 	Rev(ref string) (string, error)
 	DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error
 	DeleteBranch(branch string, force bool) error
+}
+
+// mqPostMergePatchProofGit is optional so the post-merge proof remains easy to
+// exercise with small fakes. The concrete Git implementation binds the exact
+// submitted source SHA to the push-remote branch before comparing its content
+// with the target.
+type mqPostMergePatchProofGit interface {
+	VerifyPushedCommitPatchEquivalentFromPushTarget(remote, sourceBranch, targetBranch, commit string) error
+}
+
+// mqPostMergePRProofGit is an optional authenticated-provider proof path. A
+// recorded URL/number is required; branch-only PR discovery is deliberately
+// not enough to close an MR whose source commit is not in target ancestry.
+type mqPostMergePRProofGit interface {
+	LookupPullRequest(ref git.PullRequestRef) (*git.PullRequestInfo, error)
 }
 
 type mqPostMergeBranchCleanup struct {
@@ -613,8 +628,111 @@ func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) er
 	if commit == "" {
 		return fmt.Errorf("merge proof failed for MR %s: missing submitted commit_sha", mr.ID)
 	}
-	if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w", mr.ID, target, commit, err)
+	ancestryErr := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, commit)
+	if ancestryErr == nil {
+		return nil
+	}
+
+	// A Refinery landing can preserve the reviewed source patch without
+	// preserving its commit object (for example, a transplant or squash).
+	// Keep ancestry as the primary proof and accept a fallback only when it
+	// has exact source-bound target evidence (and, when available, durable
+	// Refinery landing metadata).
+	if verifyErr := verifyMQPostMergePatchLanding(rigGit, mr, target, commit); verifyErr == nil {
+		return nil
+	}
+	if verifyErr := verifyMQPostMergePRLanding(rigGit, mr, target, commit); verifyErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w", mr.ID, target, commit, ancestryErr)
+}
+
+// verifyMQPostMergePatchLanding accepts a patch transplant only when the exact
+// submitted source branch tip is still preserved on the target. A recorded
+// MergeCommit, when present, additionally anchors the proof to the durable
+// Refinery landing record; the Git proof always checks the source push branch
+// still points at CommitSHA and compares exact target tree content.
+func verifyMQPostMergePatchLanding(rigGit mqPostMergeGit, mr *refinery.MergeRequest, target, commit string) error {
+	if strings.TrimSpace(mr.IssueID) == "" {
+		return fmt.Errorf("missing source issue")
+	}
+	if strings.TrimSpace(mr.Branch) == "" {
+		return fmt.Errorf("missing source branch")
+	}
+	landing := strings.TrimSpace(mr.MergeCommit)
+	if landing != "" {
+		if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, landing); err != nil {
+			return fmt.Errorf("landing commit %s is not on target: %w", landing, err)
+		}
+	}
+	proofGit, ok := rigGit.(mqPostMergePatchProofGit)
+	if !ok {
+		return fmt.Errorf("patch-transplant proof is unavailable")
+	}
+	if err := proofGit.VerifyPushedCommitPatchEquivalentFromPushTarget("origin", mr.Branch, target, commit); err != nil {
+		return err
+	}
+	return nil
+}
+
+// verifyMQPostMergePRLanding accepts a merged PR only through its recorded
+// identity. It checks the exact submitted head, source branch, target branch,
+// and provider-reported landing commit before allowing lifecycle closure.
+func verifyMQPostMergePRLanding(rigGit mqPostMergeGit, mr *refinery.MergeRequest, target, commit string) error {
+	if strings.TrimSpace(mr.IssueID) == "" {
+		return fmt.Errorf("missing source issue")
+	}
+	if strings.TrimSpace(mr.Branch) == "" {
+		return fmt.Errorf("missing source branch")
+	}
+	if strings.TrimSpace(mr.PRURL) == "" && mr.PRNumber <= 0 {
+		return fmt.Errorf("missing recorded pull request identity")
+	}
+	proofGit, ok := rigGit.(mqPostMergePRProofGit)
+	if !ok {
+		return fmt.Errorf("pull request proof is unavailable")
+	}
+	pr, err := proofGit.LookupPullRequest(git.PullRequestRef{
+		URL:     mr.PRURL,
+		Number:  mr.PRNumber,
+		Branch:  mr.Branch,
+		HeadSHA: commit,
+	})
+	if err != nil {
+		return err
+	}
+	if pr == nil || !pr.Merged() {
+		return fmt.Errorf("pull request is not merged")
+	}
+	if strings.TrimSpace(pr.HeadSHA) != commit {
+		return fmt.Errorf("pull request head does not match submitted commit")
+	}
+	if strings.TrimSpace(pr.HeadRefName) != strings.TrimSpace(mr.Branch) {
+		return fmt.Errorf("pull request source branch does not match MR")
+	}
+	if strings.TrimSpace(pr.BaseRefName) != target {
+		return fmt.Errorf("pull request target branch does not match MR")
+	}
+	if mr.PRNumber > 0 && pr.Number != mr.PRNumber {
+		return fmt.Errorf("pull request number does not match MR")
+	}
+	if mr.PRURL != "" && strings.TrimSpace(pr.URL) != strings.TrimSpace(mr.PRURL) {
+		return fmt.Errorf("pull request URL does not match MR")
+	}
+
+	landing := strings.TrimSpace(pr.MergeCommitSHA)
+	if landing == "" {
+		landing = strings.TrimSpace(mr.MergeCommit)
+	}
+	if landing == "" {
+		return fmt.Errorf("missing provider landing commit")
+	}
+	if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, landing); err != nil {
+		return fmt.Errorf("provider landing commit %s is not on target: %w", landing, err)
+	}
+	if strings.TrimSpace(mr.MergeCommit) == "" {
+		mr.MergeCommit = landing
 	}
 	return nil
 }

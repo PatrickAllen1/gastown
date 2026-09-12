@@ -3089,6 +3089,55 @@ func TestPushRemoteRefTargetStatusPreservesRebasedRemoteBranch(t *testing.T) {
 	}
 }
 
+func TestVerifyPushedCommitPatchEquivalentFromPushTargetAcceptsCherryPick(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/post-merge-transplant"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "transplant.txt"), []byte("reviewed patch\n"), 0644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := g.Add("transplant.txt"); err != nil {
+		t.Fatalf("Add source: %v", err)
+	}
+	if err := g.Commit("reviewed transplant"); err != nil {
+		t.Fatalf("Commit source: %v", err)
+	}
+	commit, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev source: %v", err)
+	}
+	runGit(t, localDir, "push", "origin", branch)
+
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "target.txt"), []byte("target advance\n"), 0644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := g.Add("target.txt"); err != nil {
+		t.Fatalf("Add target: %v", err)
+	}
+	if err := g.Commit("advance target"); err != nil {
+		t.Fatalf("Commit target: %v", err)
+	}
+	runGit(t, localDir, "cherry-pick", commit)
+	runGit(t, localDir, "push", "origin", mainBranch)
+
+	if err := g.VerifyPushedCommitReachableFromPushTarget("origin", mainBranch, commit); err == nil {
+		t.Fatal("ancestry proof unexpectedly accepted cherry-picked source commit")
+	}
+	if err := g.VerifyPushedCommitPatchEquivalentFromPushTarget("origin", branch, mainBranch, commit); err != nil {
+		t.Fatalf("VerifyPushedCommitPatchEquivalentFromPushTarget: %v", err)
+	}
+}
+
 func TestPushRemoteRefTargetStatusPreservesMultiCommitSquashRemoteBranch(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	if err := exec.Command("git", "-C", localDir, "merge-tree", "--write-tree", "HEAD", "HEAD").Run(); err != nil {
