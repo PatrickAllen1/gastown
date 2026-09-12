@@ -1,10 +1,15 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/refinery"
 )
@@ -13,7 +18,6 @@ type fakeMQPostMergeManager struct {
 	mr              *refinery.MergeRequest
 	findErr         error
 	postMergeErr    error
-	sourceErr       error
 	postMergeCalled bool
 	postMergeMR     *refinery.MergeRequest
 }
@@ -32,19 +36,6 @@ func (m *fakeMQPostMergeManager) PostMergeMR(mr *refinery.MergeRequest) (*refine
 		return nil, m.postMergeErr
 	}
 	return &refinery.PostMergeResult{MR: m.mr, MRClosed: true, SourceIssueClosed: true, SourceIssueID: m.mr.IssueID}, nil
-}
-
-func (m *fakeMQPostMergeManager) VerifyPostMergeSourceIssue(mr *refinery.MergeRequest) error {
-	if m.sourceErr != nil {
-		return m.sourceErr
-	}
-	if mr == nil || strings.TrimSpace(mr.IssueID) == "" {
-		return errors.New("missing source issue")
-	}
-	if branchIssue := strings.TrimSpace(parseBranchName(mr.Branch).Issue); branchIssue != "" && branchIssue != strings.TrimSpace(mr.IssueID) {
-		return errors.New("source issue does not own branch")
-	}
-	return nil
 }
 
 type fakeMQPostMergeGit struct {
@@ -118,22 +109,258 @@ func (g *fakeMQPostMergeGit) DeleteBranch(branch string, _ bool) error {
 func testMQPostMergeMR() *refinery.MergeRequest {
 	return &refinery.MergeRequest{
 		ID:           "gt-mr-proof",
-		Branch:       "polecat/test/gt-proof",
+		Branch:       "polecat/test/gt-proof+proof123",
 		Worker:       "polecats/test",
+		AgentBead:    "gt-gastown-polecat-test",
 		IssueID:      "gt-proof",
 		TargetBranch: "main",
 		CommitSHA:    "abc123def456",
+		Status:       refinery.MROpen,
 	}
 }
 
+type bareMQPostMergeManager struct {
+	mr              *refinery.MergeRequest
+	postMergeCalled bool
+}
+
+func (m *bareMQPostMergeManager) FindMRForPostMerge(string) (*refinery.MergeRequest, error) {
+	return m.mr, nil
+}
+
+func (m *bareMQPostMergeManager) PostMergeMR(mr *refinery.MergeRequest) (*refinery.PostMergeResult, error) {
+	m.postMergeCalled = true
+	return &refinery.PostMergeResult{MR: mr, MRClosed: true, SourceIssueClosed: true, SourceIssueID: mr.IssueID}, nil
+}
+
+func TestRunVerifiedMQPostMerge_ConsistentForgedSourceIssueWithoutDurableOwnershipFailsClosed(t *testing.T) {
+	mr := testMQPostMergeMR()
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	agent := completeMQSourceAgent(mr, sourceAssignee)
+	rigPath := installMQSourceAuthorityStub(t, source, nil, agent)
+	mgr := &bareMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{
+		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
+		remoteTip:  mr.CommitSHA,
+		localHead:  mr.CommitSHA,
+	}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "source issue") {
+		t.Fatalf("runVerifiedMQPostMerge error = %v, want durable source ownership failure", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("PostMerge called for a source issue with no durable backlink")
+	}
+	if rigGit.patchSource != "" || rigGit.lookupRef != (git.PullRequestRef{}) {
+		t.Fatalf("fallback acceptance attempted for forged source issue: patch=%q lookup=%+v", rigGit.patchSource, rigGit.lookupRef)
+	}
+	if len(rigGit.deletedBranches) != 0 || len(rigGit.localDeleted) != 0 {
+		t.Fatalf("branch cleanup occurred for forged source issue: remote=%v local=%v", rigGit.deletedBranches, rigGit.localDeleted)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_AcceptsExactGeneratedLifecycleOwnership(t *testing.T) {
+	mr := testMQPostMergeMR()
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	agent := completeMQSourceAgent(mr, sourceAssignee)
+	rigPath := installMQSourceAuthorityStub(t, source, []beads.Comment{{IssueID: source.ID, Author: sourceAssignee, Text: "MR created: " + mr.ID}}, agent)
+
+	if err := verifyMQPostMergeSourceIssue(rigPath, nil, mr); err != nil {
+		t.Fatalf("verifyMQPostMergeSourceIssue: %v", err)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_AcceptsExactCustomBranchBacklink(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.Branch = "feature/custom-branch"
+	mr.AgentBead = ""
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	rigPath := installMQSourceAuthorityStub(t, source, []beads.Comment{{IssueID: source.ID, Author: sourceAssignee, Text: "MR created: " + mr.ID}}, nil)
+
+	if err := verifyMQPostMergeSourceIssue(rigPath, nil, mr); err != nil {
+		t.Fatalf("verifyMQPostMergeSourceIssue: %v", err)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_RejectsMissingBacklink(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.Branch = "feature/custom-branch"
+	mr.AgentBead = ""
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: "gastown/polecats/test"}
+	rigPath := installMQSourceAuthorityStub(t, source, []beads.Comment{{IssueID: "other-source", Author: source.Assignee, Text: "MR created: " + mr.ID}}, nil)
+
+	err := verifyMQPostMergeSourceIssue(rigPath, nil, mr)
+	if err == nil || !strings.Contains(err.Error(), "ownership record") {
+		t.Fatalf("verifyMQPostMergeSourceIssue error = %v, want source-owned backlink failure", err)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_RejectsAmbiguousBacklinkAuthors(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.Branch = "feature/custom-branch"
+	mr.AgentBead = ""
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	comments := []beads.Comment{
+		{IssueID: source.ID, Author: sourceAssignee, Text: "MR created: " + mr.ID},
+		{IssueID: source.ID, Author: "gastown/polecats/victim", Text: "MR created: " + mr.ID},
+	}
+	rigPath := installMQSourceAuthorityStub(t, source, comments, nil)
+
+	err := verifyMQPostMergeSourceIssue(rigPath, nil, mr)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("verifyMQPostMergeSourceIssue error = %v, want ambiguous backlink failure", err)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_RejectsUngeneratedPolecatBranch(t *testing.T) {
+	mr := testMQPostMergeMR()
+	mr.Branch = "polecat/test/gt-proof"
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	agent := completeMQSourceAgent(mr, sourceAssignee)
+	rigPath := installMQSourceAuthorityStub(t, source, []beads.Comment{{IssueID: source.ID, Author: sourceAssignee, Text: "MR created: " + mr.ID}}, agent)
+
+	err := verifyMQPostMergeSourceIssue(rigPath, nil, mr)
+	if err == nil || !strings.Contains(err.Error(), "generated") {
+		t.Fatalf("verifyMQPostMergeSourceIssue error = %v, want ungenerated branch failure", err)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_RejectsAgentMRBranchOrSourceDrift(t *testing.T) {
+	mr := testMQPostMergeMR()
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	agent := completeMQSourceAgent(mr, sourceAssignee)
+	agent.Description = beads.FormatAgentDescription("agent", &beads.AgentFields{
+		RoleType:        "polecat",
+		Rig:             "gastown",
+		ExitType:        "COMPLETED",
+		MRID:            "gt-other-mr",
+		Branch:          mr.Branch,
+		LastSourceIssue: mr.IssueID,
+	})
+	rigPath := installMQSourceAuthorityStub(t, source, []beads.Comment{{IssueID: source.ID, Author: sourceAssignee, Text: "MR created: " + mr.ID}}, agent)
+
+	err := verifyMQPostMergeSourceIssue(rigPath, nil, mr)
+	if err == nil || !strings.Contains(err.Error(), "MRID") {
+		t.Fatalf("verifyMQPostMergeSourceIssue error = %v, want agent MR drift failure", err)
+	}
+}
+
+func TestVerifyMQPostMergeSourceIssue_RejectsMissingLegacyLifecycle(t *testing.T) {
+	mr := testMQPostMergeMR()
+	sourceAssignee := "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: sourceAssignee}
+	agent := &beads.Issue{ID: mr.AgentBead, Type: "agent", Labels: []string{"gt:agent"}, Description: "role_type: polecat\nrig: gastown\nagent_state: done"}
+	rigPath := installMQSourceAuthorityStub(t, source, []beads.Comment{{IssueID: source.ID, Author: sourceAssignee, Text: "MR created: " + mr.ID}}, agent)
+
+	err := verifyMQPostMergeSourceIssue(rigPath, nil, mr)
+	if err == nil || !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("verifyMQPostMergeSourceIssue error = %v, want missing lifecycle failure", err)
+	}
+}
+
+func completeMQSourceAgent(mr *refinery.MergeRequest, assignee string) *beads.Issue {
+	return &beads.Issue{
+		ID:       mr.AgentBead,
+		Type:     "agent",
+		Labels:   []string{"gt:agent"},
+		Assignee: assignee,
+		Status:   string(beads.StatusOpen),
+		Description: beads.FormatAgentDescription("agent", &beads.AgentFields{
+			RoleType:        "polecat",
+			Rig:             "gastown",
+			AgentState:      "done",
+			ActiveMR:        mr.ID,
+			ExitType:        "COMPLETED",
+			MRID:            mr.ID,
+			Branch:          mr.Branch,
+			LastSourceIssue: mr.IssueID,
+		}),
+	}
+}
+
+func setupCompleteMQSourceForTest(t *testing.T, mr *refinery.MergeRequest) string {
+	t.Helper()
+	const assignee = "gastown/polecats/test"
+	source := &beads.Issue{ID: mr.IssueID, Type: "task", Status: string(beads.StatusOpen), Assignee: assignee}
+	comments := []beads.Comment{{IssueID: source.ID, Author: assignee, Text: "MR created: " + mr.ID}}
+	return installMQSourceAuthorityStub(t, source, comments, completeMQSourceAgent(mr, assignee))
+}
+
+func installMQSourceAuthorityStub(t *testing.T, source *beads.Issue, comments []beads.Comment, agent *beads.Issue) string {
+	t.Helper()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	for _, dir := range []string{filepath.Join(townRoot, "mayor"), filepath.Join(townRoot, ".beads"), filepath.Join(rigPath, ".beads")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write town sentinel: %v", err)
+	}
+	jsonFile := func(name string, value any) string {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", name, err)
+		}
+		path := filepath.Join(townRoot, name+".json")
+		if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return path
+	}
+	sourcePath := jsonFile("source", []*beads.Issue{source})
+	commentsPath := jsonFile("comments", comments)
+	agentPath := ""
+	if agent != nil {
+		agentPath = jsonFile("agent", []*beads.Issue{agent})
+	}
+	binDir := t.TempDir()
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then shift; fi
+if [ "$1" = "version" ]; then echo "bd test"; exit 0; fi
+if [ "$1" = "show" ] && [ "$2" = %q ]; then cat %q; exit 0; fi
+if [ "$1" = "show" ] && [ "$2" = %q ]; then cat %q; exit 0; fi
+if [ "$1" = "comments" ] && [ "$2" = %q ]; then cat %q; exit 0; fi
+printf '[]\n'
+`, source.ID, sourcePath, func() string {
+		if agent == nil {
+			return "__no_agent__"
+		}
+		return agent.ID
+	}(), func() string {
+		if agent == nil {
+			return sourcePath
+		}
+		return agentPath
+	}(), source.ID, commentsPath)
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+	return rigPath
+}
+
 func TestRunVerifiedMQPostMerge_ProofFailurePreservesRecordsAndBranch(t *testing.T) {
-	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
+	mr := testMQPostMergeMR()
+	rigPath := setupCompleteMQSourceForTest(t, mr)
+	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErr: errors.New("not reachable"),
 		patchErr:  errors.New("not preserved"),
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mgr.mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "merge proof failed") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want merge proof failure", err)
 	}
@@ -304,6 +531,7 @@ func TestRunVerifiedMQPostMerge_SourceTargetBranchFailsClosed(t *testing.T) {
 func TestRunVerifiedMQPostMerge_AcceptsAuthenticatedPatchTransplant(t *testing.T) {
 	mr := testMQPostMergeMR()
 	mr.MergeCommit = "landing987"
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
@@ -311,7 +539,7 @@ func TestRunVerifiedMQPostMerge_AcceptsAuthenticatedPatchTransplant(t *testing.T
 		localHead:  mr.CommitSHA,
 	}
 
-	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, false)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -331,6 +559,7 @@ func TestRunVerifiedMQPostMerge_AcceptsAuthenticatedPatchTransplant(t *testing.T
 
 func TestRunVerifiedMQPostMerge_SourceBoundProofDoesNotRequireLandingField(t *testing.T) {
 	mr := testMQPostMergeMR()
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
@@ -338,7 +567,7 @@ func TestRunVerifiedMQPostMerge_SourceBoundProofDoesNotRequireLandingField(t *te
 		localHead:  mr.CommitSHA,
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, true)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, true)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -353,13 +582,14 @@ func TestRunVerifiedMQPostMerge_SourceBoundProofDoesNotRequireLandingField(t *te
 func TestRunVerifiedMQPostMerge_PatchTransplantDivergenceFailsClosed(t *testing.T) {
 	mr := testMQPostMergeMR()
 	mr.MergeCommit = "landing987"
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
 		patchErr:   errors.New("submitted patch is not preserved"),
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "merge proof failed") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want merge proof failure", err)
 	}
@@ -397,6 +627,7 @@ func TestRunVerifiedMQPostMerge_AcceptsRecordedMergedPRLanding(t *testing.T) {
 	mr := testMQPostMergeMR()
 	mr.PRURL = "https://github.com/upstream/repo/pull/42"
 	mr.PRNumber = 42
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
@@ -414,7 +645,7 @@ func TestRunVerifiedMQPostMerge_AcceptsRecordedMergedPRLanding(t *testing.T) {
 		localHead: mr.CommitSHA,
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, true)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, true)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -437,6 +668,7 @@ func TestRunVerifiedMQPostMerge_MergedPRMissingProviderLandingFailsClosed(t *tes
 	mr.MergeCommit = "recorded-landing"
 	mr.PRURL = "https://github.com/upstream/repo/pull/42"
 	mr.PRNumber = 42
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErrs: map[string]error{mr.CommitSHA: errors.New("candidate is not an ancestor")},
@@ -452,7 +684,7 @@ func TestRunVerifiedMQPostMerge_MergedPRMissingProviderLandingFailsClosed(t *tes
 		},
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "provider landing") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want missing provider landing failure", err)
 	}
@@ -472,6 +704,7 @@ func TestRunVerifiedMQPostMerge_MergedPRConflictingLandingFailsClosed(t *testing
 	mr.MergeCommit = "recorded-landing"
 	mr.PRURL = "https://github.com/upstream/repo/pull/42"
 	mr.PRNumber = 42
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
 		verifyErrs: map[string]error{
@@ -490,7 +723,7 @@ func TestRunVerifiedMQPostMerge_MergedPRConflictingLandingFailsClosed(t *testing
 		},
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "conflict") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want conflicting landing failure", err)
 	}
@@ -509,6 +742,7 @@ func TestRunVerifiedMQPostMerge_MergedPRUnreachableProviderLandingFailsClosed(t 
 	mr := testMQPostMergeMR()
 	mr.PRURL = "https://github.com/upstream/repo/pull/42"
 	mr.PRNumber = 42
+	rigPath := setupCompleteMQSourceForTest(t, mr)
 	const providerLanding = "provider-landing"
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{
@@ -528,7 +762,7 @@ func TestRunVerifiedMQPostMerge_MergedPRUnreachableProviderLandingFailsClosed(t 
 		},
 	}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, rigPath, rigGit, mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "not on target") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want unreachable provider landing failure", err)
 	}

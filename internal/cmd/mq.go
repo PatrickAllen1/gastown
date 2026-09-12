@@ -8,8 +8,11 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
@@ -216,13 +219,6 @@ type mqPostMergePatchProofGit interface {
 // not enough to close an MR whose source commit is not in target ancestry.
 type mqPostMergePRProofGit interface {
 	LookupPullRequest(ref git.PullRequestRef) (*git.PullRequestInfo, error)
-}
-
-// mqPostMergeSourceAuthority is an optional source-ownership seam for tests
-// and alternate managers. The production refinery manager does not implement
-// it; production proof uses the authoritative routed beads lookup below.
-type mqPostMergeSourceAuthority interface {
-	VerifyPostMergeSourceIssue(mr *refinery.MergeRequest) error
 }
 
 type mqPostMergeBranchCleanup struct {
@@ -667,10 +663,10 @@ func verifyMQPostMergeProofAt(rigPath string, mgr mqPostMergeManager, rigGit mqP
 
 // verifyMQPostMergeSourceIssue binds an ancestry-negative landing to the
 // source issue that owns the submitted branch and commit. Generated polecat
-// branches carry that identity directly; custom branches use the authoritative
-// source issue lookup and the submission back-link instead of trusting the MR
-// IssueID field by itself.
+// branches require the complete durable completion chain; custom branches use
+// the authoritative source issue lookup and submission back-link.
 func verifyMQPostMergeSourceIssue(rigPath string, mgr mqPostMergeManager, mr *refinery.MergeRequest) error {
+	_ = mgr // kept in the proof signature so callers can pass their MR manager
 	if mr == nil {
 		return fmt.Errorf("merge request is missing")
 	}
@@ -686,26 +682,21 @@ func verifyMQPostMergeSourceIssue(rigPath string, mgr mqPostMergeManager, mr *re
 		return fmt.Errorf("missing source branch")
 	}
 
-	// Canonical polecat branches are generated from the exact hooked issue. Do
-	// not accept a different (or merely non-empty) IssueID for that branch.
-	branchIssue := strings.TrimSpace(parseBranchName(branch).Issue)
-	if branchIssue != "" {
-		if branchIssue != sourceIssue {
-			return fmt.Errorf("source issue %s does not own branch %s (branch identifies %s)", sourceIssue, branch, branchIssue)
+	branchMeta, polecatBranch := polecat.ParseBranchName(branch)
+	if strings.HasPrefix(branch, "polecat/") {
+		if !polecatBranch {
+			return fmt.Errorf("polecat branch %s has invalid generated identity", branch)
 		}
-	}
-
-	// An optional authority keeps small proof fakes independent of a beads
-	// process. It still runs after the canonical branch identity check above.
-	if authority, ok := mgr.(mqPostMergeSourceAuthority); ok {
-		return authority.VerifyPostMergeSourceIssue(mr)
-	}
-	if strings.TrimSpace(rigPath) == "" {
-		if branchIssue != "" {
-			return nil
+		if !branchMeta.Generated {
+			return fmt.Errorf("polecat branch %s is not generated", branch)
 		}
+		if strings.TrimSpace(branchMeta.Issue) != sourceIssue {
+			return fmt.Errorf("source issue %s does not own branch %s (branch identifies %s)", sourceIssue, branch, strings.TrimSpace(branchMeta.Issue))
+		}
+	} else if strings.TrimSpace(rigPath) == "" {
 		return fmt.Errorf("source issue ownership proof unavailable for custom branch %s", branch)
 	}
+
 	source, err := resolveSubmitSourceIssue(rigPath, sourceIssue)
 	if err != nil {
 		return err
@@ -714,33 +705,111 @@ func verifyMQPostMergeSourceIssue(rigPath string, mgr mqPostMergeManager, mr *re
 		return fmt.Errorf("source issue %s ownership lookup returned no authoritative beads source", sourceIssue)
 	}
 	if source.Issue == nil || strings.TrimSpace(source.Issue.ID) != sourceIssue {
-		return fmt.Errorf("authoritative source issue identity mismatch: got %q, want %q", sourceIssueID(source), sourceIssue)
+		got := ""
+		if source.Issue != nil {
+			got = strings.TrimSpace(source.Issue.ID)
+		}
+		return fmt.Errorf("authoritative source issue identity mismatch: got %q, want %q", got, sourceIssue)
+	}
+	assignee := strings.TrimSpace(source.Issue.Assignee)
+	if assignee == "" {
+		return fmt.Errorf("source issue %s has no assignee", sourceIssue)
+	}
+	if err := verifyMQPostMergeSourceBacklink(source, mr.ID, sourceIssue, assignee); err != nil {
+		return err
 	}
 
-	// A canonical branch carries the exact issue identity. For custom branches,
-	// require the submission's source back-link as the durable branch/commit
-	// ownership record.
-	if branchIssue != "" {
+	if !polecatBranch {
 		return nil
 	}
+
+	if strings.TrimSpace(mr.AgentBead) == "" {
+		return fmt.Errorf("source issue %s has no agent completion record", sourceIssue)
+	}
+	agentIssue, err := source.BD.ForAgentBead().Show(strings.TrimSpace(mr.AgentBead))
+	if err != nil {
+		return fmt.Errorf("read agent completion record %s: %w", strings.TrimSpace(mr.AgentBead), err)
+	}
+	if !beads.IsAgentBead(agentIssue) {
+		return fmt.Errorf("agent completion record %s is not an agent bead", strings.TrimSpace(mr.AgentBead))
+	}
+	_, role, name, ok := beads.ParseAgentBeadID(strings.TrimSpace(mr.AgentBead))
+	if !ok || role != "polecat" {
+		return fmt.Errorf("agent completion record %s has invalid polecat identity", strings.TrimSpace(mr.AgentBead))
+	}
+	if strings.TrimSpace(name) != strings.TrimSpace(branchMeta.Polecat) {
+		return fmt.Errorf("agent completion record %s name %q does not match branch polecat %q", strings.TrimSpace(mr.AgentBead), strings.TrimSpace(name), strings.TrimSpace(branchMeta.Polecat))
+	}
+	if canonical := strings.TrimSpace(mail.AgentBeadIDToAddress(strings.TrimSpace(mr.AgentBead))); canonical == "" || canonical != assignee {
+		return fmt.Errorf("agent completion record %s address %q does not match source assignee %q", strings.TrimSpace(mr.AgentBead), canonical, assignee)
+	}
+	agentFields := beads.ParseAgentFields(agentIssue.Description)
+	if agentFields == nil {
+		return fmt.Errorf("agent completion record %s lifecycle is missing", strings.TrimSpace(mr.AgentBead))
+	}
+	checks := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{name: "role", got: agentFields.RoleType, want: "polecat"},
+		{name: "MRID", got: agentFields.MRID, want: strings.TrimSpace(mr.ID)},
+		{name: "Branch", got: agentFields.Branch, want: branch},
+		{name: "LastSourceIssue", got: agentFields.LastSourceIssue, want: sourceIssue},
+		{name: "ExitType", got: agentFields.ExitType, want: "COMPLETED"},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.got) != strings.TrimSpace(check.want) {
+			return fmt.Errorf("agent completion record %s lifecycle %s=%q, want %q", strings.TrimSpace(mr.AgentBead), check.name, strings.TrimSpace(check.got), strings.TrimSpace(check.want))
+		}
+	}
+	if agentFields.MRFailed || agentFields.PushFailed {
+		return fmt.Errorf("agent completion record %s lifecycle reports failure", strings.TrimSpace(mr.AgentBead))
+	}
+	switch mr.Status {
+	case refinery.MROpen, refinery.MRInProgress:
+		if strings.TrimSpace(agentFields.ActiveMR) != strings.TrimSpace(mr.ID) {
+			return fmt.Errorf("agent completion record %s active_mr=%q, want %q for open MR", strings.TrimSpace(mr.AgentBead), strings.TrimSpace(agentFields.ActiveMR), strings.TrimSpace(mr.ID))
+		}
+	case refinery.MRClosed:
+		if active := strings.TrimSpace(agentFields.ActiveMR); active != "" && active != strings.TrimSpace(mr.ID) {
+			return fmt.Errorf("agent completion record %s active_mr=%q, want empty or %q for terminal MR", strings.TrimSpace(mr.AgentBead), active, strings.TrimSpace(mr.ID))
+		}
+	default:
+		return fmt.Errorf("agent completion record %s has unknown MR status %q", strings.TrimSpace(mr.AgentBead), mr.Status)
+	}
+	return nil
+}
+
+func verifyMQPostMergeSourceBacklink(source *submitSourceIssue, mrID, sourceIssue, assignee string) error {
 	comments, err := source.BD.Comments(sourceIssue)
 	if err != nil {
 		return fmt.Errorf("read source issue %s ownership record: %w", sourceIssue, err)
 	}
-	want := "MR created: " + strings.TrimSpace(mr.ID)
+	want := "MR created: " + strings.TrimSpace(mrID)
+	authors := make(map[string]struct{})
 	for _, comment := range comments {
-		if strings.TrimSpace(comment.Text) == want {
-			return nil
+		if strings.TrimSpace(comment.Text) != want {
+			continue
+		}
+		if strings.TrimSpace(comment.IssueID) != sourceIssue {
+			continue
+		}
+		author := strings.TrimSpace(comment.Author)
+		if author != "" {
+			authors[author] = struct{}{}
 		}
 	}
-	return fmt.Errorf("source issue %s has no ownership record for MR %s", sourceIssue, strings.TrimSpace(mr.ID))
-}
-
-func sourceIssueID(source *submitSourceIssue) string {
-	if source == nil || source.Issue == nil {
-		return ""
+	if len(authors) == 0 {
+		return fmt.Errorf("source issue %s has no ownership record for MR %s", sourceIssue, strings.TrimSpace(mrID))
 	}
-	return strings.TrimSpace(source.Issue.ID)
+	if len(authors) != 1 {
+		return fmt.Errorf("source issue %s has ambiguous ownership record for MR %s", sourceIssue, strings.TrimSpace(mrID))
+	}
+	if _, ok := authors[assignee]; !ok {
+		return fmt.Errorf("source issue %s ownership record author does not match assignee %s", sourceIssue, assignee)
+	}
+	return nil
 }
 
 // verifyMQPostMergePatchLanding accepts a patch transplant only when the exact
