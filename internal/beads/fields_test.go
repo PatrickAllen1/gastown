@@ -1,8 +1,10 @@
 package beads
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- parseIntField (not covered in beads_test.go) ---
@@ -766,5 +768,332 @@ func TestSetConvoyFieldsPreservesWatchers(t *testing.T) {
 	}
 	if !strings.Contains(got, "Some text") {
 		t.Errorf("lost prose, got:\n%s", got)
+	}
+}
+
+// --- ReviewReceiptV1 (GT-VD3A) ---
+
+func reviewReceiptV1Fixture(t *testing.T) (ReviewReceiptV1, Comment, ReviewReceiptValidationContext) {
+	t.Helper()
+	when := "2026-09-12T10:00:00.123456Z"
+	receipt := ReviewReceiptV1{
+		ReceiptVersion:   1,
+		SourceIssue:      "gt-source",
+		ReviewChildIssue: "gt-review",
+		CandidateCommit:  strings.Repeat("a", 40),
+		CandidateTree:    strings.Repeat("b", 40),
+		TargetRef:        "refs/heads/main",
+		Verdict:          ReviewReceiptVerdictFinalPass,
+		ReviewModel:      "codex-sol-medium",
+		ReviewProfile:    "medium",
+	}
+	comment := Comment{
+		ID:        "comment-1",
+		IssueID:   "gt-review",
+		Author:    "reviewer/",
+		Text:      FormatReviewReceiptV1(receipt),
+		CreatedAt: when,
+	}
+	ctx := ReviewReceiptValidationContext{
+		SourceIssue: &Issue{
+			ID:       "gt-source",
+			Status:   "open",
+			Assignee: "author/",
+		},
+		ReviewChildIssue: &Issue{
+			ID:     "gt-review",
+			Parent: "gt-source",
+			Status: "closed",
+		},
+		CandidateCommit: receipt.CandidateCommit,
+		CandidateTree:   receipt.CandidateTree,
+		TargetRef:       receipt.TargetRef,
+		FrozenAt:        mustReviewReceiptTime(t, "2026-09-12T09:00:00Z"),
+		Author:          "author/",
+		ReachableCommits: []string{
+			receipt.CandidateCommit,
+		},
+	}
+	return receipt, comment, ctx
+}
+
+func mustReviewReceiptTime(t *testing.T, raw string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t.Fatalf("parse fixture time: %v", err)
+	}
+	return parsed
+}
+
+func TestReviewReceiptV1RoundTripDerivesCommentAuthority(t *testing.T) {
+	receipt, comment, _ := reviewReceiptV1Fixture(t)
+	got, err := ParseReviewReceiptV1(comment)
+	if err != nil {
+		t.Fatalf("ParseReviewReceiptV1() error = %v", err)
+	}
+	if got.SourceIssue != receipt.SourceIssue || got.ReviewChildIssue != receipt.ReviewChildIssue {
+		t.Fatalf("identity fields = %+v, want source/review child from payload", got)
+	}
+	if got.Reviewer != comment.Author {
+		t.Fatalf("Reviewer = %q, want stored Comment.Author %q", got.Reviewer, comment.Author)
+	}
+	if got.CommentID != comment.ID {
+		t.Fatalf("CommentID = %q, want %q", got.CommentID, comment.ID)
+	}
+	wantTime := mustReviewReceiptTime(t, comment.CreatedAt)
+	if !got.ServerTime.Equal(wantTime) {
+		t.Fatalf("ServerTime = %s, want %s", got.ServerTime, wantTime)
+	}
+	if got.Text != "" {
+		t.Fatalf("derived Text must not be populated from caller data: %q", got.Text)
+	}
+	if got.CanonicalText() != comment.Text {
+		t.Fatalf("canonical text mismatch:\n%s\nwant:\n%s", got.CanonicalText(), comment.Text)
+	}
+	wantCanonical := strings.Join([]string{
+		"schema: ReviewReceiptV1",
+		"receipt_version: 1",
+		"source_issue: gt-source",
+		"review_child_issue: gt-review",
+		"candidate_commit: " + strings.Repeat("a", 40),
+		"candidate_tree: " + strings.Repeat("b", 40),
+		"target_ref: refs/heads/main",
+		"verdict: FINAL_PASS",
+		"review_model: codex-sol-medium",
+		"review_profile: medium",
+	}, "\n")
+	if comment.Text != wantCanonical {
+		t.Fatalf("canonical body = %q, want %q", comment.Text, wantCanonical)
+	}
+	if got, want := FormatReviewReceiptV1(got), comment.Text; got != want {
+		t.Fatalf("FormatReviewReceiptV1(parse(comment)) = %q, want %q", got, want)
+	}
+}
+
+func TestReviewReceiptV1ParserRejectsMalformedUnknownDuplicateAndForgedFields(t *testing.T) {
+	receipt, comment, _ := reviewReceiptV1Fixture(t)
+	canonical := FormatReviewReceiptV1(receipt)
+	cases := map[string]string{
+		"unknown metadata":         canonical + "\nmetadata: forged",
+		"forged reviewer":          canonical + "\nreviewer: author/",
+		"forged timestamp":         canonical + "\ntimestamp: 2026-09-12T10:00:00Z",
+		"duplicate candidate":      canonical + "\ncandidate_commit: " + receipt.CandidateCommit,
+		"blank line":               strings.Replace(canonical, "\n", "\n\n", 1),
+		"wrong marker":             strings.Replace(canonical, "schema: ReviewReceiptV1", "schema: ReviewReceiptV2", 1),
+		"malformed target":         strings.Replace(canonical, "target_ref: refs/heads/main", "target_ref: refs/heads/a@{b}", 1),
+		"missing comment identity": canonical,
+	}
+	for name, text := range cases {
+		t.Run(name, func(t *testing.T) {
+			testComment := comment
+			if name == "missing comment identity" {
+				testComment.ID = ""
+			}
+			testComment.Text = text
+			if _, err := ParseReviewReceiptV1(testComment); err == nil {
+				t.Fatalf("ParseReviewReceiptV1() accepted hostile body:\n%s", text)
+			}
+		})
+	}
+}
+
+func TestReviewReceiptV1ValidatorRejectsIdentityFreshnessBindingAndReachabilityHostiles(t *testing.T) {
+	receipt, comment, ctx := reviewReceiptV1Fixture(t)
+	parsed, err := ParseReviewReceiptV1(comment)
+	if err != nil {
+		t.Fatalf("fixture parse: %v", err)
+	}
+	if err := ValidateReviewReceiptV1(parsed, comment, ctx); err != nil {
+		t.Fatalf("valid fixture rejected: %v", err)
+	}
+	if err := ValidateReviewReceiptV1(receipt, comment, ctx); err != nil {
+		t.Fatalf("payload-only validation must derive comment authority: %v", err)
+	}
+
+	tests := map[string]func(*ReviewReceiptV1, *Comment, *ReviewReceiptValidationContext){
+		"author reviewer": func(r *ReviewReceiptV1, c *Comment, _ *ReviewReceiptValidationContext) {
+			c.Author = "author/"
+			r.Reviewer = c.Author
+		},
+		"stale pre-freeze": func(_ *ReviewReceiptV1, c *Comment, _ *ReviewReceiptValidationContext) {
+			c.CreatedAt = "2026-09-12T08:59:59Z"
+		},
+		"candidate mismatch": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.CandidateCommit = strings.Repeat("c", 40)
+		},
+		"tree mismatch": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.CandidateTree = strings.Repeat("d", 40)
+		},
+		"target mismatch": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.TargetRef = "refs/heads/release"
+		},
+		"unrelated reachable SHA": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.ReachableCommits = []string{strings.Repeat("c", 40)}
+		},
+		"candidate tree relation": func(r *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.CommitTrees = map[string]string{r.CandidateCommit: strings.Repeat("c", 40)}
+		},
+		"target reachability map": func(r *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.TargetReachable = map[string]bool{r.CandidateCommit: false}
+		},
+		"open child": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.ReviewChildIssue.Status = "open"
+		},
+		"wrong child": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.ReviewChildIssue.ID = "gt-other-review"
+		},
+		"arbitrary child metadata": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.ReviewChildIssue.Metadata = json.RawMessage(`{"operator":"forged"}`)
+		},
+		"arbitrary child comment": func(_ *ReviewReceiptV1, _ *Comment, c *ReviewReceiptValidationContext) {
+			c.ReviewChildIssue.Comments = []Comment{{
+				ID:        "comment-arbitrary",
+				IssueID:   "gt-review",
+				Author:    "reviewer/",
+				Text:      "approved by operator",
+				CreatedAt: "2026-09-12T10:00:00Z",
+			}}
+		},
+		"non-independent model": func(r *ReviewReceiptV1, c *Comment, _ *ReviewReceiptValidationContext) {
+			r.ReviewModel = "codex-luna-max"
+			c.Text = FormatReviewReceiptV1(*r)
+		},
+		"non-independent profile": func(r *ReviewReceiptV1, c *Comment, _ *ReviewReceiptValidationContext) {
+			r.ReviewProfile = "large"
+			c.Text = FormatReviewReceiptV1(*r)
+		},
+		"forged derived timestamp": func(r *ReviewReceiptV1, _ *Comment, _ *ReviewReceiptValidationContext) {
+			r.ServerTimestamp = r.ServerTime.Add(time.Hour)
+		},
+		"forged derived text": func(r *ReviewReceiptV1, _ *Comment, _ *ReviewReceiptValidationContext) {
+			r.Text = "reviewer: author/"
+		},
+		"missing typed version": func(r *ReviewReceiptV1, _ *Comment, _ *ReviewReceiptValidationContext) {
+			r.ReceiptVersion = 0
+			r.Version = 0
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			r := *parsed
+			c := comment
+			validation := ctx
+			if ctx.ReviewChildIssue != nil {
+				child := *ctx.ReviewChildIssue
+				validation.ReviewChildIssue = &child
+			}
+			if ctx.SourceIssue != nil {
+				source := *ctx.SourceIssue
+				validation.SourceIssue = &source
+			}
+			mutate(&r, &c, &validation)
+			if err := ValidateReviewReceiptV1(r, c, validation); err == nil {
+				t.Fatal("ValidateReviewReceiptV1() accepted hostile fixture")
+			}
+		})
+	}
+}
+
+func TestReviewReceiptV1SelectionRequiresExactlyOneCurrentReceipt(t *testing.T) {
+	first, firstComment, ctx := reviewReceiptV1Fixture(t)
+	parsedFirst, err := ParseReviewReceiptV1(firstComment)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	if err := ValidateReviewReceiptV1(parsedFirst, firstComment, ctx); err != nil {
+		t.Fatalf("first validation: %v", err)
+	}
+
+	second := first
+	second.SupersedesReceiptID = firstComment.ID
+	secondComment := firstComment
+	secondComment.ID = "comment-2"
+	secondComment.CreatedAt = "2026-09-12T10:01:00Z"
+	secondComment.Text = FormatReviewReceiptV1(second)
+	current, err := SelectCurrentReviewReceiptV1([]Comment{secondComment, firstComment}, ctx)
+	if err != nil {
+		t.Fatalf("valid supersession rejected: %v", err)
+	}
+	if current.CommentID != secondComment.ID || current.SupersedesReceiptID != firstComment.ID {
+		t.Fatalf("current = %+v, want superseding comment-2", current)
+	}
+
+	parallel := secondComment
+	parallel.ID = "comment-3"
+	parallel.Text = FormatReviewReceiptV1(first)
+	if _, err := SelectCurrentReviewReceiptV1([]Comment{firstComment, secondComment, parallel}, ctx); err == nil {
+		t.Fatal("parallel unsuperseded receipt was accepted")
+	}
+
+	self := secondComment
+	self.ID = "comment-self"
+	selfReceipt := second
+	selfReceipt.SupersedesReceiptID = self.ID
+	self.Text = FormatReviewReceiptV1(selfReceipt)
+	if _, err := SelectCurrentReviewReceiptV1([]Comment{self}, ctx); err == nil {
+		t.Fatal("self-supersession was accepted")
+	}
+
+	cycleA := firstComment
+	cycleA.ID = "cycle-a"
+	cycleA.Text = FormatReviewReceiptV1(ReviewReceiptV1{
+		ReceiptVersion:      1,
+		SourceIssue:         first.SourceIssue,
+		ReviewChildIssue:    first.ReviewChildIssue,
+		CandidateCommit:     first.CandidateCommit,
+		CandidateTree:       first.CandidateTree,
+		TargetRef:           first.TargetRef,
+		Verdict:             first.Verdict,
+		ReviewModel:         first.ReviewModel,
+		ReviewProfile:       first.ReviewProfile,
+		SupersedesReceiptID: "cycle-b",
+	})
+	cycleB := secondComment
+	cycleB.ID = "cycle-b"
+	cycleB.Text = FormatReviewReceiptV1(ReviewReceiptV1{
+		ReceiptVersion:      1,
+		SourceIssue:         first.SourceIssue,
+		ReviewChildIssue:    first.ReviewChildIssue,
+		CandidateCommit:     first.CandidateCommit,
+		CandidateTree:       first.CandidateTree,
+		TargetRef:           first.TargetRef,
+		Verdict:             first.Verdict,
+		ReviewModel:         first.ReviewModel,
+		ReviewProfile:       first.ReviewProfile,
+		SupersedesReceiptID: "cycle-a",
+	})
+	if _, err := SelectCurrentReviewReceiptV1([]Comment{cycleA, cycleB}, ctx); err == nil {
+		t.Fatal("supersession cycle was accepted")
+	}
+
+	unknown := secondComment
+	unknown.ID = "comment-unknown"
+	unknown.CreatedAt = "2026-09-12T10:02:00Z"
+	unknownReceipt := second
+	unknownReceipt.SupersedesReceiptID = "missing-receipt"
+	unknown.Text = FormatReviewReceiptV1(unknownReceipt)
+	if _, err := SelectCurrentReviewReceiptV1([]Comment{unknown}, ctx); err == nil {
+		t.Fatal("unknown supersession target was accepted")
+	}
+
+	notNewer := secondComment
+	notNewer.ID = "comment-not-newer"
+	notNewer.CreatedAt = firstComment.CreatedAt
+	if _, err := SelectCurrentReviewReceiptV1([]Comment{firstComment, notNewer}, ctx); err == nil {
+		t.Fatal("non-newer superseding receipt was accepted")
+	}
+
+	reversed, err := SelectCurrentReviewReceiptV1([]Comment{firstComment, secondComment}, ctx)
+	if err != nil {
+		t.Fatalf("forward selection after hostile cases: %v", err)
+	}
+	forward := reversed.CommentID
+	reversed, err = SelectCurrentReviewReceiptV1([]Comment{secondComment, firstComment}, ctx)
+	if err != nil {
+		t.Fatalf("reverse selection: %v", err)
+	}
+	if reversed.CommentID != forward {
+		t.Fatalf("selection changed with input order: forward=%q reverse=%q", forward, reversed.CommentID)
 	}
 }

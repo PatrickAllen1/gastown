@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Note: AgentFields, ParseAgentFields, FormatAgentDescription, and CreateAgentBead are in beads.go
@@ -1128,4 +1132,985 @@ func ExpandRolePattern(pattern, townRoot, rig, name, role, prefix string) string
 	result = strings.ReplaceAll(result, "{role}", role)
 	result = strings.ReplaceAll(result, "{prefix}", prefix)
 	return result
+}
+
+// ReviewReceiptV1Schema identifies the only review receipt wire format that
+// this package accepts. Review receipts deliberately live in ordinary Beads
+// comments: the comment's stored Author, CreatedAt, and ID are the authority
+// for reviewer identity, server time, and receipt identity respectively.
+const ReviewReceiptV1Schema = "ReviewReceiptV1"
+
+const (
+	// ReviewReceiptV1Version is the integer version carried by a receipt body.
+	ReviewReceiptV1Version = 1
+	// ReviewReceiptVersionV1 is a descriptive alias for callers that prefer the
+	// version-first naming used by other typed contracts.
+	ReviewReceiptVersionV1 = ReviewReceiptV1Version
+)
+
+// ReviewReceiptVerdict is the closed set of review outcomes that can be
+// persisted in a ReviewReceiptV1 comment.
+type ReviewReceiptVerdict string
+
+const (
+	ReviewReceiptVerdictFinalPass       ReviewReceiptVerdict = "FINAL_PASS"
+	ReviewReceiptVerdictChangesRequired ReviewReceiptVerdict = "CHANGES_REQUIRED"
+	// Short aliases keep call sites readable while retaining one typed verdict.
+	ReviewVerdictFinalPass       = ReviewReceiptVerdictFinalPass
+	ReviewVerdictChangesRequired = ReviewReceiptVerdictChangesRequired
+)
+
+// ReviewReceiptV1 is the typed payload stored in a dedicated review-child
+// Beads comment. Reviewer, server time, comment ID, and Text are derived
+// values; they are intentionally never serialized into the comment body.
+//
+// The *ID, *SHA, Version, ReviewVerdict, Supersedes, Target, Model, and Profile
+// fields are compatibility aliases for callers migrating from prose receipts.
+// The formatter rejects conflicting aliases and emits only the canonical
+// fields below.
+type ReviewReceiptV1 struct {
+	ReceiptVersion   int
+	SourceIssue      string
+	ReviewChildIssue string
+	CandidateCommit  string
+	CandidateTree    string
+	TargetRef        string
+	Verdict          ReviewReceiptVerdict
+	ReviewModel      string
+	ReviewProfile    string
+	// SupersedesReceiptID is empty only for the first receipt; every replacement
+	// names the exact prior Comment.ID so selection can reject detached history.
+	SupersedesReceiptID string
+
+	// Canonical comment authority, populated only by ParseReviewReceiptV1.
+	Schema          string
+	Reviewer        string
+	ServerTime      time.Time
+	ServerTimestamp time.Time
+	Timestamp       time.Time
+	CommentID       string
+	ReceiptID       string
+	Text            string
+
+	// Input aliases. They are not additional wire fields.
+	Version            int
+	SourceIssueID      string
+	ReviewChildIssueID string
+	ReviewChild        string
+	CandidateCommitSHA string
+	CandidateTreeSHA   string
+	Target             string
+	ReviewVerdict      ReviewReceiptVerdict
+	Model              string
+	Profile            string
+	Supersedes         string
+}
+
+// ReviewReceiptValidationContext binds a receipt to the immutable review
+// situation that it claims to describe. A context is intentionally explicit:
+// validation without source/child/candidate/tree/target/freeze authority is
+// rejected rather than guessing from caller text.
+type ReviewReceiptValidationContext struct {
+	SourceIssue      *Issue
+	ReviewChildIssue *Issue
+
+	SourceIssueID      string
+	ReviewChildIssueID string
+	ReviewChild        string
+	CandidateCommit    string
+	CandidateTree      string
+	TargetRef          string
+	ExpectedTargetRef  string
+	CandidateCommitSHA string
+	CandidateTreeSHA   string
+
+	FrozenAt          time.Time
+	FreezeAt          time.Time
+	CandidateFrozenAt time.Time
+	FreezeTimestamp   string
+
+	// Author is the implementation author. Coauthors and excluded reviewers
+	// are all disallowed as the stored Comment.Author.
+	Author               string
+	AuthorIdentity       string
+	ImplementationAuthor string
+	Coauthors            []string
+	Authors              []string
+	AuthorIdentities     []string
+	ExcludedReviewers    []string
+	Excluded             []string
+	ExclusionSet         []string
+
+	// If any reachability set is supplied, the exact candidate must occur in
+	// every supplied set. This prevents an unrelated target-reachable SHA from
+	// being accepted as the reviewed candidate.
+	ReachableCommits       []string
+	TargetReachableCommits []string
+	Reachable              map[string]bool
+	TargetReachable        map[string]bool
+	ReachableCommitSet     map[string]bool
+	CommitTrees            map[string]string
+}
+
+// ReviewReceiptContext and ReviewReceiptSelectionContext are aliases for the
+// same source-bound contract. Aliases avoid parallel, subtly different stores.
+type ReviewReceiptContext = ReviewReceiptValidationContext
+type ReviewReceiptSelectionContext = ReviewReceiptValidationContext
+
+// CanonicalText returns the deterministic wire representation of the payload.
+// Derived comment authority is intentionally excluded.
+func (r ReviewReceiptV1) CanonicalText() string {
+	return FormatReviewReceiptV1(r)
+}
+
+// IsFinalPass reports whether the typed verdict is FINAL_PASS.
+func (r ReviewReceiptV1) IsFinalPass() bool {
+	payload, err := r.canonicalPayload()
+	return err == nil && payload.Verdict == ReviewReceiptVerdictFinalPass
+}
+
+// IsChangesRequired reports whether the typed verdict is CHANGES_REQUIRED.
+func (r ReviewReceiptV1) IsChangesRequired() bool {
+	payload, err := r.canonicalPayload()
+	return err == nil && payload.Verdict == ReviewReceiptVerdictChangesRequired
+}
+
+// canonicalPayload resolves compatibility aliases into one payload and
+// rejects conflicting duplicate representations before formatting or
+// validation can proceed.
+func (r ReviewReceiptV1) canonicalPayload() (ReviewReceiptV1, error) {
+	var err error
+	canonical := r
+	canonical.Schema, err = reconcileReceiptString("schema", r.Schema, "")
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	if canonical.Schema == "" {
+		canonical.Schema = ReviewReceiptV1Schema
+	}
+	canonical.SourceIssue, err = reconcileReceiptString("source_issue", r.SourceIssue, r.SourceIssueID)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.ReviewChildIssue, err = reconcileReceiptString("review_child_issue", r.ReviewChildIssue, r.ReviewChildIssueID)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.ReviewChildIssue, err = reconcileReceiptString("review_child_issue", canonical.ReviewChildIssue, r.ReviewChild)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.CandidateCommit, err = reconcileReceiptString("candidate_commit", r.CandidateCommit, r.CandidateCommitSHA)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.CandidateTree, err = reconcileReceiptString("candidate_tree", r.CandidateTree, r.CandidateTreeSHA)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.TargetRef, err = reconcileReceiptString("target_ref", r.TargetRef, r.Target)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	verdict := string(r.Verdict)
+	aliasVerdict := string(r.ReviewVerdict)
+	verdict, err = reconcileReceiptString("verdict", verdict, aliasVerdict)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.Verdict = ReviewReceiptVerdict(verdict)
+	canonical.ReviewModel, err = reconcileReceiptString("review_model", r.ReviewModel, r.Model)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.ReviewProfile, err = reconcileReceiptString("review_profile", r.ReviewProfile, r.Profile)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	canonical.SupersedesReceiptID, err = reconcileReceiptString("supersedes_receipt_id", r.SupersedesReceiptID, r.Supersedes)
+	if err != nil {
+		return ReviewReceiptV1{}, err
+	}
+	if r.ReceiptVersion != 0 && r.Version != 0 && r.ReceiptVersion != r.Version {
+		return ReviewReceiptV1{}, fmt.Errorf("review receipt version aliases conflict")
+	}
+	canonical.ReceiptVersion = r.ReceiptVersion
+	if canonical.ReceiptVersion == 0 {
+		canonical.ReceiptVersion = r.Version
+	}
+	if canonical.ReceiptVersion == 0 {
+		canonical.ReceiptVersion = ReviewReceiptV1Version
+	}
+	canonical.Version = canonical.ReceiptVersion
+	return canonical, nil
+}
+
+func reconcileReceiptString(field, primary, alias string) (string, error) {
+	if primary != "" && alias != "" && primary != alias {
+		return "", fmt.Errorf("review receipt %s aliases conflict", field)
+	}
+	if primary != "" {
+		return primary, nil
+	}
+	return alias, nil
+}
+
+// FormatReviewReceiptV1 emits the only accepted canonical comment body. It
+// returns an empty string for an incomplete or conflicting payload; callers
+// must not use it to smuggle arbitrary metadata into a review child.
+func FormatReviewReceiptV1(input interface{}) string {
+	receipt, ok := reviewReceiptValue(input)
+	if !ok {
+		return ""
+	}
+	payload, err := receipt.canonicalPayload()
+	if err != nil || validateReviewReceiptPayload(payload) != nil {
+		return ""
+	}
+	lines := []string{
+		"schema: " + ReviewReceiptV1Schema,
+		"receipt_version: " + strconv.Itoa(payload.ReceiptVersion),
+		"source_issue: " + payload.SourceIssue,
+		"review_child_issue: " + payload.ReviewChildIssue,
+		"candidate_commit: " + payload.CandidateCommit,
+		"candidate_tree: " + payload.CandidateTree,
+		"target_ref: " + payload.TargetRef,
+		"verdict: " + string(payload.Verdict),
+		"review_model: " + payload.ReviewModel,
+		"review_profile: " + payload.ReviewProfile,
+	}
+	if payload.SupersedesReceiptID != "" {
+		lines = append(lines, "supersedes_receipt_id: "+payload.SupersedesReceiptID)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ParseReviewReceiptV1 parses one stored Beads comment. The reviewer and
+// server time are read from Comment.Author and Comment.CreatedAt; body fields
+// pretending to carry either value are unknown and rejected.
+func ParseReviewReceiptV1(input interface{}) (*ReviewReceiptV1, error) {
+	comment, err := reviewReceiptComment(input)
+	if err != nil {
+		return nil, err
+	}
+	if comment.ID == "" {
+		return nil, fmt.Errorf("review receipt comment ID is missing")
+	}
+	if err := validReviewReceiptID(comment.ID); err != nil {
+		return nil, fmt.Errorf("review receipt comment ID: %w", err)
+	}
+	if strings.TrimSpace(comment.Author) == "" || comment.Author != strings.TrimSpace(comment.Author) {
+		return nil, fmt.Errorf("review receipt comment has invalid stored author")
+	}
+	if !utf8.ValidString(comment.Text) || comment.Text == "" {
+		return nil, fmt.Errorf("review receipt comment has invalid body")
+	}
+	if comment.Text != strings.TrimSpace(comment.Text) || strings.Contains(comment.Text, "\r") {
+		return nil, fmt.Errorf("review receipt body is not canonical whitespace")
+	}
+	serverTime, err := parseReviewReceiptTime(comment.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("review receipt comment timestamp: %w", err)
+	}
+
+	values := make(map[string]string, 11)
+	for lineNumber, line := range strings.Split(comment.Text, "\n") {
+		if line == "" || line != strings.TrimSpace(line) {
+			return nil, fmt.Errorf("review receipt line %d is not canonical", lineNumber+1)
+		}
+		separator := strings.Index(line, ": ")
+		if separator <= 0 || separator+2 >= len(line) || strings.Contains(line[:separator], " ") {
+			return nil, fmt.Errorf("review receipt line %d is malformed", lineNumber+1)
+		}
+		key := line[:separator]
+		value := line[separator+2:]
+		if _, exists := values[key]; exists {
+			return nil, fmt.Errorf("review receipt field %q is duplicated", key)
+		}
+		switch key {
+		case "schema", "receipt_version", "source_issue", "review_child_issue", "candidate_commit", "candidate_tree", "target_ref", "verdict", "review_model", "review_profile", "supersedes_receipt_id":
+			values[key] = value
+		default:
+			return nil, fmt.Errorf("review receipt field %q is unknown", key)
+		}
+		if err := validReviewReceiptScalar(value, key); err != nil {
+			return nil, err
+		}
+	}
+	for _, required := range []string{"schema", "receipt_version", "source_issue", "review_child_issue", "candidate_commit", "candidate_tree", "target_ref", "verdict", "review_model", "review_profile"} {
+		if values[required] == "" {
+			return nil, fmt.Errorf("review receipt field %q is missing", required)
+		}
+	}
+	if values["schema"] != ReviewReceiptV1Schema {
+		return nil, fmt.Errorf("review receipt schema %q is unsupported", values["schema"])
+	}
+	version, err := strconv.Atoi(values["receipt_version"])
+	if err != nil || strconv.Itoa(version) != values["receipt_version"] || version != ReviewReceiptV1Version {
+		return nil, fmt.Errorf("review receipt version %q is unsupported", values["receipt_version"])
+	}
+	receipt := ReviewReceiptV1{
+		Schema:              values["schema"],
+		ReceiptVersion:      version,
+		Version:             version,
+		SourceIssue:         values["source_issue"],
+		SourceIssueID:       values["source_issue"],
+		ReviewChildIssue:    values["review_child_issue"],
+		ReviewChildIssueID:  values["review_child_issue"],
+		ReviewChild:         values["review_child_issue"],
+		CandidateCommit:     values["candidate_commit"],
+		CandidateCommitSHA:  values["candidate_commit"],
+		CandidateTree:       values["candidate_tree"],
+		CandidateTreeSHA:    values["candidate_tree"],
+		TargetRef:           values["target_ref"],
+		Target:              values["target_ref"],
+		Verdict:             ReviewReceiptVerdict(values["verdict"]),
+		ReviewVerdict:       ReviewReceiptVerdict(values["verdict"]),
+		ReviewModel:         values["review_model"],
+		Model:               values["review_model"],
+		ReviewProfile:       values["review_profile"],
+		Profile:             values["review_profile"],
+		SupersedesReceiptID: values["supersedes_receipt_id"],
+		Supersedes:          values["supersedes_receipt_id"],
+		Reviewer:            comment.Author,
+		ServerTime:          serverTime,
+		ServerTimestamp:     serverTime,
+		Timestamp:           serverTime,
+		CommentID:           comment.ID,
+		ReceiptID:           comment.ID,
+	}
+	if err := validateReviewReceiptPayload(receipt); err != nil {
+		return nil, err
+	}
+	if canonical := FormatReviewReceiptV1(receipt); canonical != comment.Text {
+		return nil, fmt.Errorf("review receipt body is not canonical")
+	}
+	return &receipt, nil
+}
+
+func parseReviewReceiptTime(raw string) (time.Time, error) {
+	if raw == "" || raw != strings.TrimSpace(raw) {
+		return time.Time{}, fmt.Errorf("timestamp is empty or padded")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parsed, nil
+}
+
+func validReviewReceiptScalar(value, field string) error {
+	if value == "" || value != strings.TrimSpace(value) || !utf8.ValidString(value) {
+		return fmt.Errorf("review receipt field %q has invalid value", field)
+	}
+	for _, char := range value {
+		if unicode.IsControl(char) || unicode.IsSpace(char) {
+			return fmt.Errorf("review receipt field %q contains whitespace or control data", field)
+		}
+	}
+	return nil
+}
+
+func validateReviewReceiptPayload(receipt ReviewReceiptV1) error {
+	payload, err := receipt.canonicalPayload()
+	if err != nil {
+		return err
+	}
+	if payload.Schema != ReviewReceiptV1Schema || payload.ReceiptVersion != ReviewReceiptV1Version {
+		return fmt.Errorf("review receipt version/schema is unsupported")
+	}
+	for name, value := range map[string]string{
+		"source_issue":       payload.SourceIssue,
+		"review_child_issue": payload.ReviewChildIssue,
+		"candidate_commit":   payload.CandidateCommit,
+		"candidate_tree":     payload.CandidateTree,
+		"target_ref":         payload.TargetRef,
+		"review_model":       payload.ReviewModel,
+		"review_profile":     payload.ReviewProfile,
+	} {
+		if err := validReviewReceiptScalar(value, name); err != nil {
+			return err
+		}
+		if strings.Contains(value, ":") {
+			return fmt.Errorf("review receipt field %q contains a forbidden separator", name)
+		}
+	}
+	if !isReviewReceiptSHA(payload.CandidateCommit) || !isReviewReceiptSHA(payload.CandidateTree) {
+		return fmt.Errorf("review receipt candidate commit/tree must be lowercase Git SHA-1 values")
+	}
+	if err := validateReviewReceiptTargetRef(payload.TargetRef); err != nil {
+		return err
+	}
+	if payload.Verdict != ReviewReceiptVerdictFinalPass && payload.Verdict != ReviewReceiptVerdictChangesRequired {
+		return fmt.Errorf("review receipt verdict %q is unsupported", payload.Verdict)
+	}
+	if !isIndependentReviewModel(payload.ReviewModel, payload.ReviewProfile) {
+		return fmt.Errorf("review receipt model/profile is not codex-sol-medium/medium")
+	}
+	if payload.SupersedesReceiptID != "" {
+		if err := validReviewReceiptID(payload.SupersedesReceiptID); err != nil {
+			return fmt.Errorf("review receipt supersession: %w", err)
+		}
+	}
+	return nil
+}
+
+func isReviewReceiptSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isReviewReceiptID(value string) bool {
+	if value == "" || len(value) > 256 {
+		return false
+	}
+	for _, char := range value {
+		if unicode.IsControl(char) || char == ' ' || char == '\t' || char == '\r' || char == '\n' || char == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func validReviewReceiptID(value string) error {
+	if !isReviewReceiptID(value) {
+		return fmt.Errorf("receipt ID %q is malformed", value)
+	}
+	return nil
+}
+
+func validateReviewReceiptTargetRef(target string) error {
+	if err := validReviewReceiptScalar(target, "target_ref"); err != nil {
+		return err
+	}
+	if strings.HasPrefix(target, "/") || strings.HasSuffix(target, "/") || strings.Contains(target, "..") || strings.Contains(target, "//") || strings.Contains(target, "@{") {
+		return fmt.Errorf("review receipt target ref %q is malformed", target)
+	}
+	for _, char := range target {
+		switch char {
+		case '~', '^', ':', '?', '*', '[', '\\', ' ':
+			return fmt.Errorf("review receipt target ref %q is malformed", target)
+		}
+	}
+	for _, component := range strings.Split(target, "/") {
+		if component == "" || component == "." || component == ".." || strings.HasSuffix(component, ".") || strings.HasSuffix(component, ".lock") {
+			return fmt.Errorf("review receipt target ref %q is malformed", target)
+		}
+	}
+	return nil
+}
+
+func reviewReceiptValue(input interface{}) (ReviewReceiptV1, bool) {
+	switch value := input.(type) {
+	case ReviewReceiptV1:
+		return value, true
+	case *ReviewReceiptV1:
+		if value != nil {
+			return *value, true
+		}
+	}
+	return ReviewReceiptV1{}, false
+}
+
+func reviewReceiptComment(input interface{}) (Comment, error) {
+	switch value := input.(type) {
+	case Comment:
+		return value, nil
+	case *Comment:
+		if value != nil {
+			return *value, nil
+		}
+	}
+	return Comment{}, fmt.Errorf("review receipt requires a stored Beads Comment")
+}
+
+func reviewReceiptPayloadEqual(left, right ReviewReceiptV1) bool {
+	leftPayload, leftErr := left.canonicalPayload()
+	rightPayload, rightErr := right.canonicalPayload()
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return leftPayload.Schema == rightPayload.Schema &&
+		leftPayload.ReceiptVersion == rightPayload.ReceiptVersion &&
+		leftPayload.SourceIssue == rightPayload.SourceIssue &&
+		leftPayload.ReviewChildIssue == rightPayload.ReviewChildIssue &&
+		leftPayload.CandidateCommit == rightPayload.CandidateCommit &&
+		leftPayload.CandidateTree == rightPayload.CandidateTree &&
+		leftPayload.TargetRef == rightPayload.TargetRef &&
+		leftPayload.Verdict == rightPayload.Verdict &&
+		leftPayload.ReviewModel == rightPayload.ReviewModel &&
+		leftPayload.ReviewProfile == rightPayload.ReviewProfile &&
+		leftPayload.SupersedesReceiptID == rightPayload.SupersedesReceiptID
+}
+
+// ValidateReviewReceiptV1 validates a parsed payload against its stored
+// comment and source-bound context. The variadic form accepts either
+// (Comment, ReviewReceiptValidationContext), (*Comment, *Context), or a
+// context paired with a Comment; omitting the stored Comment fails closed.
+func ValidateReviewReceiptV1(input interface{}, args ...interface{}) error {
+	receipt, ok := reviewReceiptValue(input)
+	if !ok {
+		comment, err := reviewReceiptComment(input)
+		if err != nil {
+			return fmt.Errorf("review receipt payload is missing")
+		}
+		parsed, err := ParseReviewReceiptV1(comment)
+		if err != nil {
+			return err
+		}
+		receipt = *parsed
+		args = append([]interface{}{comment}, args...)
+	}
+	if receipt.ReceiptVersion == 0 && receipt.Version == 0 {
+		return fmt.Errorf("review receipt version is missing")
+	}
+	comment, context, err := reviewReceiptValidationArgs(args)
+	if err != nil {
+		return err
+	}
+	parsed, err := ParseReviewReceiptV1(comment)
+	if err != nil {
+		return err
+	}
+	if !reviewReceiptPayloadEqual(receipt, *parsed) {
+		return fmt.Errorf("review receipt payload does not match stored comment")
+	}
+	if receipt.CommentID != "" && receipt.CommentID != parsed.CommentID {
+		return fmt.Errorf("review receipt comment ID is not authoritative")
+	}
+	if receipt.ReceiptID != "" && receipt.ReceiptID != parsed.ReceiptID {
+		return fmt.Errorf("review receipt ID is not authoritative")
+	}
+	if receipt.Reviewer != "" && receipt.Reviewer != parsed.Reviewer {
+		return fmt.Errorf("review receipt reviewer is not authoritative")
+	}
+	for _, suppliedTime := range []time.Time{receipt.ServerTime, receipt.ServerTimestamp, receipt.Timestamp} {
+		if !suppliedTime.IsZero() && !suppliedTime.Equal(parsed.ServerTime) {
+			return fmt.Errorf("review receipt server time is not authoritative")
+		}
+	}
+	if receipt.Text != "" {
+		return fmt.Errorf("review receipt text is derived from the stored Comment")
+	}
+	// Continue with the parser's authority-bearing value. A caller may submit
+	// only the typed payload for convenience, but zero or forged derived fields
+	// must never bypass freshness or reviewer-independence checks.
+	return validateReviewReceiptAgainstContext(*parsed, comment, context)
+}
+
+func reviewReceiptValidationArgs(args []interface{}) (Comment, ReviewReceiptValidationContext, error) {
+	var comment Comment
+	var haveComment bool
+	var context ReviewReceiptValidationContext
+	var haveContext bool
+	for _, arg := range args {
+		switch value := arg.(type) {
+		case Comment:
+			if haveComment {
+				return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt stored Comment authority is duplicated")
+			}
+			comment, haveComment = value, true
+		case *Comment:
+			if value == nil {
+				return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt comment is nil")
+			}
+			if haveComment {
+				return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt stored Comment authority is duplicated")
+			}
+			comment, haveComment = *value, true
+		case ReviewReceiptValidationContext:
+			if haveContext {
+				return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt validation context is duplicated")
+			}
+			context, haveContext = value, true
+		case *ReviewReceiptValidationContext:
+			if value == nil {
+				return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt validation context is nil")
+			}
+			if haveContext {
+				return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt validation context is duplicated")
+			}
+			context, haveContext = *value, true
+		default:
+			return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("unsupported review receipt validation argument %T", arg)
+		}
+	}
+	if !haveComment {
+		return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt validation requires stored Comment authority")
+	}
+	if !haveContext {
+		return Comment{}, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt validation context is missing")
+	}
+	return comment, context, nil
+}
+
+// ValidateReviewReceiptCommentV1 parses and validates one stored comment in a
+// single operation, retaining the derived identity/time fields.
+func ValidateReviewReceiptCommentV1(comment Comment, context ReviewReceiptValidationContext) (*ReviewReceiptV1, error) {
+	receipt, err := ParseReviewReceiptV1(comment)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateReviewReceiptV1(receipt, comment, context); err != nil {
+		return nil, err
+	}
+	return receipt, nil
+}
+
+func validateReviewReceiptAgainstContext(receipt ReviewReceiptV1, comment Comment, context ReviewReceiptValidationContext) error {
+	sourceID, childID, candidate, tree, target, frozenAt, err := normalizeReviewReceiptContext(context)
+	if err != nil {
+		return err
+	}
+	if comment.ID == "" {
+		return fmt.Errorf("review receipt comment ID is missing")
+	}
+	if comment.IssueID != childID {
+		return fmt.Errorf("review receipt comment belongs to %q, want review child %q", comment.IssueID, childID)
+	}
+	if receipt.SourceIssue != sourceID || receipt.ReviewChildIssue != childID {
+		return fmt.Errorf("review receipt source/review-child binding mismatch")
+	}
+	if receipt.CandidateCommit != candidate || receipt.CandidateTree != tree || receipt.TargetRef != target {
+		return fmt.Errorf("review receipt candidate/tree/target binding mismatch")
+	}
+	if receipt.ServerTime.Before(frozenAt) {
+		return fmt.Errorf("review receipt comment predates immutable candidate freeze")
+	}
+	if receipt.SupersedesReceiptID != "" && receipt.SupersedesReceiptID == receipt.ReceiptID {
+		return fmt.Errorf("review receipt cannot supersede itself")
+	}
+	if !isIndependentReviewModel(receipt.ReviewModel, receipt.ReviewProfile) {
+		return fmt.Errorf("review receipt model/profile is not an independent Sol-medium review")
+	}
+	if reviewReceiptAuthorExcluded(receipt.Reviewer, context, sourceID) {
+		return fmt.Errorf("review receipt reviewer is an author/coauthor/excluded identity")
+	}
+	if len(context.ReachableCommits) > 0 || context.ReachableCommits != nil || len(context.TargetReachableCommits) > 0 || context.TargetReachableCommits != nil || context.Reachable != nil || context.TargetReachable != nil || context.ReachableCommitSet != nil {
+		if !reviewReceiptReachableInAllSets(receipt.CandidateCommit, context) {
+			return fmt.Errorf("review receipt candidate is not the exact target-reachable SHA")
+		}
+	}
+	for _, treeByCommit := range []map[string]string{context.CommitTrees} {
+		if treeByCommit != nil {
+			boundTree, ok := treeByCommit[receipt.CandidateCommit]
+			if !ok || boundTree != receipt.CandidateTree {
+				return fmt.Errorf("review receipt candidate/tree is not the authenticated commit mapping")
+			}
+		}
+	}
+	child := context.ReviewChildIssue
+	source := context.SourceIssue
+	if source == nil || child == nil {
+		return fmt.Errorf("review receipt requires source and dedicated review-child issues")
+	}
+	if source.ID != sourceID || child.ID != childID || child.Parent != sourceID {
+		return fmt.Errorf("review receipt source/review-child parent binding mismatch")
+	}
+	if source.ID == child.ID {
+		return fmt.Errorf("review receipt source and review child must differ")
+	}
+	if !IssueStatus(child.Status).IsTerminal() {
+		return fmt.Errorf("review receipt child is not terminal")
+	}
+	if reviewReceiptHasArbitraryMetadata(child.Metadata) {
+		return fmt.Errorf("review receipt child has arbitrary metadata")
+	}
+	if child.Comments != nil {
+		for _, stored := range child.Comments {
+			if _, err := ParseReviewReceiptV1(stored); err != nil {
+				return fmt.Errorf("review receipt child has arbitrary or malformed comment: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeReviewReceiptContext(context ReviewReceiptValidationContext) (string, string, string, string, string, time.Time, error) {
+	if context.SourceIssue == nil || context.ReviewChildIssue == nil {
+		return "", "", "", "", "", time.Time{}, fmt.Errorf("review receipt context requires source and review-child issues")
+	}
+	sourceID := context.SourceIssue.ID
+	if context.SourceIssueID != "" && context.SourceIssueID != sourceID {
+		return "", "", "", "", "", time.Time{}, fmt.Errorf("review receipt source issue aliases conflict")
+	}
+	childID := context.ReviewChildIssue.ID
+	for _, alias := range []string{context.ReviewChildIssueID, context.ReviewChild} {
+		if alias != "" && alias != childID {
+			return "", "", "", "", "", time.Time{}, fmt.Errorf("review receipt review-child aliases conflict")
+		}
+	}
+	candidate, err := reconcileReceiptString("candidate_commit", context.CandidateCommit, context.CandidateCommitSHA)
+	if err != nil {
+		return "", "", "", "", "", time.Time{}, err
+	}
+	tree, err := reconcileReceiptString("candidate_tree", context.CandidateTree, context.CandidateTreeSHA)
+	if err != nil {
+		return "", "", "", "", "", time.Time{}, err
+	}
+	target, err := reconcileReceiptString("target_ref", context.TargetRef, context.ExpectedTargetRef)
+	if err != nil {
+		return "", "", "", "", "", time.Time{}, err
+	}
+	frozenAt, err := reconcileReviewReceiptTimes(context.FrozenAt, context.FreezeAt, context.CandidateFrozenAt)
+	if err != nil {
+		return "", "", "", "", "", time.Time{}, err
+	}
+	if context.FreezeTimestamp != "" {
+		parsed, parseErr := parseReviewReceiptTime(context.FreezeTimestamp)
+		if parseErr != nil {
+			return "", "", "", "", "", time.Time{}, fmt.Errorf("review receipt freeze timestamp: %w", parseErr)
+		}
+		if !frozenAt.IsZero() && !frozenAt.Equal(parsed) {
+			return "", "", "", "", "", time.Time{}, fmt.Errorf("review receipt freeze timestamp aliases conflict")
+		}
+		frozenAt = parsed
+	}
+	if sourceID == "" || childID == "" || candidate == "" || tree == "" || target == "" || frozenAt.IsZero() {
+		return "", "", "", "", "", time.Time{}, fmt.Errorf("review receipt context is incomplete")
+	}
+	return sourceID, childID, candidate, tree, target, frozenAt, nil
+}
+
+func reconcileReviewReceiptTimes(values ...time.Time) (time.Time, error) {
+	var selected time.Time
+	for _, value := range values {
+		if value.IsZero() {
+			continue
+		}
+		if !selected.IsZero() && !selected.Equal(value) {
+			return time.Time{}, fmt.Errorf("review receipt freeze time aliases conflict")
+		}
+		selected = value
+	}
+	return selected, nil
+}
+
+func reviewReceiptAuthorExcluded(reviewer string, context ReviewReceiptValidationContext, sourceID string) bool {
+	identities := make([]string, 0, 1+len(context.Coauthors)+len(context.Authors)+len(context.AuthorIdentities)+len(context.ExcludedReviewers)+len(context.Excluded)+len(context.ExclusionSet))
+	identities = append(identities, context.Author, context.AuthorIdentity, context.ImplementationAuthor)
+	identities = append(identities, context.Coauthors...)
+	identities = append(identities, context.Authors...)
+	identities = append(identities, context.AuthorIdentities...)
+	identities = append(identities, context.ExcludedReviewers...)
+	identities = append(identities, context.Excluded...)
+	identities = append(identities, context.ExclusionSet...)
+	if context.SourceIssue != nil && context.SourceIssue.ID == sourceID {
+		identities = append(identities, context.SourceIssue.Assignee, context.SourceIssue.CreatedBy)
+	}
+	reviewer = strings.TrimSpace(reviewer)
+	for _, identity := range identities {
+		identity = strings.TrimSpace(identity)
+		if identity != "" && strings.EqualFold(reviewer, identity) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIndependentReviewModel(model, profile string) bool {
+	return model == "codex-sol-medium" && profile == "medium"
+}
+
+func reviewReceiptReachableInAllSets(candidate string, context ReviewReceiptValidationContext) bool {
+	for _, set := range [][]string{context.ReachableCommits, context.TargetReachableCommits} {
+		if set == nil {
+			continue
+		}
+		found := false
+		for _, value := range set {
+			if value == candidate {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	for _, set := range []map[string]bool{context.Reachable, context.TargetReachable, context.ReachableCommitSet} {
+		if set != nil && !set[candidate] {
+			return false
+		}
+	}
+	return true
+}
+
+func reviewReceiptHasArbitraryMetadata(metadata json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(metadata))
+	if trimmed == "" || trimmed == "null" {
+		return false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(metadata, &object); err != nil {
+		return true
+	}
+	return len(object) != 0
+}
+
+// SelectCurrentReviewReceiptV1 parses and validates all comments in a
+// dedicated review child, then follows the explicit supersession graph. Any
+// malformed comment, duplicate ID, unknown supersession, cycle, or more than
+// one unsuperseded leaf fails closed.
+func SelectCurrentReviewReceiptV1(input interface{}, args ...interface{}) (*ReviewReceiptV1, error) {
+	comments, err := reviewReceiptComments(input)
+	if err != nil {
+		return nil, err
+	}
+	_, context, err := reviewReceiptSelectionArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	if len(comments) == 0 {
+		return nil, fmt.Errorf("review receipt set is empty")
+	}
+	receipts := make(map[string]*ReviewReceiptV1, len(comments))
+	for _, comment := range comments {
+		receipt, parseErr := ParseReviewReceiptV1(comment)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if err := ValidateReviewReceiptV1(receipt, comment, context); err != nil {
+			return nil, err
+		}
+		if receipt.CommentID == "" {
+			return nil, fmt.Errorf("review receipt comment ID is missing")
+		}
+		if _, exists := receipts[receipt.CommentID]; exists {
+			return nil, fmt.Errorf("review receipt comment ID %q is duplicated", receipt.CommentID)
+		}
+		receipts[receipt.CommentID] = receipt
+	}
+	supersededBy := make(map[string]string, len(receipts))
+	for id, receipt := range receipts {
+		parent := receipt.SupersedesReceiptID
+		if parent == "" {
+			continue
+		}
+		if parent == id {
+			return nil, fmt.Errorf("review receipt %q self-supersedes", id)
+		}
+		if _, exists := receipts[parent]; !exists {
+			return nil, fmt.Errorf("review receipt %q supersedes unknown receipt %q", id, parent)
+		}
+		if !receipt.ServerTime.After(receipts[parent].ServerTime) {
+			return nil, fmt.Errorf("review receipt %q is not newer than superseded receipt %q", id, parent)
+		}
+		if prior, exists := supersededBy[parent]; exists && prior != id {
+			return nil, fmt.Errorf("review receipt %q has conflicting unsuperseded successors", parent)
+		}
+		supersededBy[parent] = id
+	}
+	for id := range receipts {
+		visited := make(map[string]bool, len(receipts))
+		current := id
+		for current != "" {
+			if visited[current] {
+				return nil, fmt.Errorf("review receipt supersession cycle at %q", current)
+			}
+			visited[current] = true
+			receipt := receipts[current]
+			if receipt == nil {
+				return nil, fmt.Errorf("review receipt graph contains a nil receipt")
+			}
+			current = receipt.SupersedesReceiptID
+		}
+	}
+	var leaves []*ReviewReceiptV1
+	for id, receipt := range receipts {
+		if _, superseded := supersededBy[id]; !superseded {
+			leaves = append(leaves, receipt)
+		}
+	}
+	if len(leaves) != 1 {
+		return nil, fmt.Errorf("review receipt set has %d current unsuperseded receipts; want exactly one", len(leaves))
+	}
+	return leaves[0], nil
+}
+
+func reviewReceiptSelectionArgs(args []interface{}) ([]Comment, ReviewReceiptValidationContext, error) {
+	var context ReviewReceiptValidationContext
+	var haveContext bool
+	for _, arg := range args {
+		switch value := arg.(type) {
+		case ReviewReceiptValidationContext:
+			if haveContext {
+				return nil, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt selection context is duplicated")
+			}
+			context, haveContext = value, true
+		case *ReviewReceiptValidationContext:
+			if value == nil {
+				return nil, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt validation context is nil")
+			}
+			if haveContext {
+				return nil, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt selection context is duplicated")
+			}
+			context, haveContext = *value, true
+		default:
+			return nil, ReviewReceiptValidationContext{}, fmt.Errorf("unsupported review receipt selection argument %T", arg)
+		}
+	}
+	if !haveContext {
+		return nil, ReviewReceiptValidationContext{}, fmt.Errorf("review receipt selection context is missing")
+	}
+	return nil, context, nil
+}
+
+func reviewReceiptComments(input interface{}) ([]Comment, error) {
+	switch values := input.(type) {
+	case []Comment:
+		return values, nil
+	case []*Comment:
+		comments := make([]Comment, 0, len(values))
+		for _, value := range values {
+			if value == nil {
+				return nil, fmt.Errorf("review receipt comment is nil")
+			}
+			comments = append(comments, *value)
+		}
+		return comments, nil
+	case Comment:
+		return []Comment{values}, nil
+	case *Comment:
+		if values == nil {
+			return nil, fmt.Errorf("review receipt comment is nil")
+		}
+		return []Comment{*values}, nil
+	default:
+		return nil, fmt.Errorf("review receipt requires Beads comments, got %T", input)
+	}
+}
+
+// SelectCurrentReviewReceiptV1FromIssue is the child-oriented convenience
+// entry point used by MQ/Refinery consumers. The child comments are the only
+// candidate receipt set; no aggregate GitHub or metadata state is consulted.
+func SelectCurrentReviewReceiptV1FromIssue(context ReviewReceiptValidationContext) (*ReviewReceiptV1, error) {
+	if context.ReviewChildIssue == nil {
+		return nil, fmt.Errorf("review receipt review child is missing")
+	}
+	return SelectCurrentReviewReceiptV1(context.ReviewChildIssue.Comments, context)
+}
+
+// ParseReviewReceipt is a short compatibility alias for the versioned parser.
+func ParseReviewReceipt(input interface{}) (*ReviewReceiptV1, error) {
+	return ParseReviewReceiptV1(input)
+}
+
+// FormatReviewReceipt is a short compatibility alias for the versioned
+// formatter.
+func FormatReviewReceipt(input interface{}) string {
+	return FormatReviewReceiptV1(input)
+}
+
+// SelectCurrentReviewReceipt is a short compatibility alias for the strict
+// versioned selector.
+func SelectCurrentReviewReceipt(input interface{}, args ...interface{}) (*ReviewReceiptV1, error) {
+	return SelectCurrentReviewReceiptV1(input, args...)
 }
