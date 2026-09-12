@@ -2914,3 +2914,94 @@ func TestReuseIdlePolecat_NoSessionNoop(t *testing.T) {
 		t.Fatal("expected error from worktree operations")
 	}
 }
+
+func installManagerHasSessionErrorTmux(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("hostile tmux wrapper uses a POSIX shell")
+	}
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux not installed")
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "has-session-probed")
+	script := `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "has-session" ] && [ ! -e "$GT_MANAGER_HOSTILE_TMUX_MARKER" ]; then
+    : > "$GT_MANAGER_HOSTILE_TMUX_MARKER"
+    echo "injected has-session failure" >&2
+    exit 42
+  fi
+done
+exec "$GT_MANAGER_REAL_TMUX" "$@"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0755); err != nil {
+		t.Fatalf("write hostile tmux wrapper: %v", err)
+	}
+	t.Setenv("GT_MANAGER_HOSTILE_TMUX_MARKER", marker)
+	t.Setenv("GT_MANAGER_REAL_TMUX", realTmux)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func managerGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return string(out)
+}
+
+func TestReuseIdlePolecatFailsClosedOnHasSessionError(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	worktreeGit := git.NewGit(polecat.ClonePath)
+	if err := worktreeGit.CleanForce(); err != nil {
+		t.Fatalf("clean fixture worktree: %v", err)
+	}
+	beforeBranch, err := worktreeGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("read branch before hostile probe: %v", err)
+	}
+	beforeHead, err := worktreeGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("read HEAD before hostile probe: %v", err)
+	}
+	beforeStatus, err := worktreeGit.CheckUncommittedWork()
+	if err != nil {
+		t.Fatalf("read worktree status before hostile probe: %v", err)
+	}
+	beforeWorktrees := managerGitOutput(t, polecat.ClonePath, "worktree", "list", "--porcelain")
+
+	mgr.tmux = tmux.NewTmux()
+	installManagerHasSessionErrorTmux(t)
+	_, err = mgr.ReuseIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
+	if err == nil {
+		t.Errorf("non-not-found HasSession error must fail closed")
+	} else if !strings.Contains(err.Error(), "session") {
+		t.Fatalf("HasSession error = %v, want session probe context", err)
+	}
+
+	afterBranch, err := worktreeGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("read branch after hostile probe: %v", err)
+	}
+	afterHead, err := worktreeGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("read HEAD after hostile probe: %v", err)
+	}
+	afterStatus, err := worktreeGit.CheckUncommittedWork()
+	if err != nil {
+		t.Fatalf("read worktree status after hostile probe: %v", err)
+	}
+	afterWorktrees := managerGitOutput(t, polecat.ClonePath, "worktree", "list", "--porcelain")
+	if afterBranch != beforeBranch || afterHead != beforeHead || afterStatus.String() != beforeStatus.String() || afterWorktrees != beforeWorktrees {
+		t.Fatalf("hostile HasSession probe mutated polecat:\nbranch %q -> %q\nHEAD %s -> %s\nstatus %q -> %q\nworktrees changed=%v", beforeBranch, afterBranch, beforeHead, afterHead, beforeStatus.String(), afterStatus.String(), beforeWorktrees != afterWorktrees)
+	}
+}

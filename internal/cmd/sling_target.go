@@ -262,6 +262,19 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 	agentID, pane, workDir, err := resolveTargetAgentFn(target)
 	if err != nil {
 		if rigName, ok := missingPolecatTargetRig(target, opts.Create, opts.TownRoot); ok {
+			canonicalRig, canonicalName, named := canonicalNamedPolecatTarget(target, opts.Create, opts.TownRoot)
+			if named {
+				rigName = canonicalRig
+				if !opts.Create {
+					exists, statErr := canonicalPolecatPathExists(opts.TownRoot, canonicalRig, canonicalName)
+					if statErr != nil {
+						return nil, statErr
+					}
+					if !exists {
+						return nil, fmt.Errorf("named polecat %s/%s does not exist; use --create to create it", canonicalRig, canonicalName)
+					}
+				}
+			}
 			if opts.BeadID != "" && !opts.Force {
 				if err := checkCrossRigGuard(opts.BeadID, rigName+"/polecats/_", opts.TownRoot); err != nil {
 					return nil, err
@@ -280,6 +293,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 				Create:        opts.Create,
 				HookBead:      opts.HookBead,
 				Agent:         opts.Agent,
+				PolecatName:   canonicalName,
 				BaseBranch:    opts.BaseBranch,
 				ResumeBranch:  opts.ResumeBranch,
 				SkipAdmission: opts.SkipPolecatAdmission,
@@ -291,7 +305,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			result.Agent = spawnInfo.AgentID()
 			result.NewPolecatInfo = spawnInfo
 			result.WorkDir = spawnInfo.ClonePath
-			result.HookSetAtomically = opts.HookBead != ""
+			result.HookSetAtomically = spawnInfo.HookSetAtomically || opts.HookBead != ""
 			if !opts.NoBoot {
 				wakeRigAgents(rigName)
 			}
@@ -321,14 +335,13 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 }
 
 func missingPolecatTargetRig(target string, allowShorthand bool, townRoot string) (string, bool) {
-	if isPolecatTarget(target) {
-		parts := strings.Split(target, "/")
-		return parts[0], true
+	parts := strings.Split(target, "/")
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "polecats") {
+		return strings.ToLower(parts[0]), true
 	}
 	if !allowShorthand {
 		return "", false
 	}
-	parts := strings.Split(target, "/")
 	if len(parts) != 2 || knownRoles[strings.ToLower(parts[1])] {
 		return "", false
 	}
@@ -336,9 +349,50 @@ func missingPolecatTargetRig(target string, allowShorthand bool, townRoot string
 		townRoot = detectTownRootFromCwd()
 	}
 	if townRoot != "" {
-		if info, err := os.Stat(filepath.Join(townRoot, parts[0], "crew", parts[1])); err == nil && info.IsDir() {
+		if info, err := os.Stat(filepath.Join(townRoot, strings.ToLower(parts[0]), "crew", strings.ToLower(parts[1]))); err == nil && info.IsDir() {
 			return "", false
 		}
 	}
-	return parts[0], true
+	return strings.ToLower(parts[0]), true
+}
+
+// polecatNameForTarget preserves an explicit polecat identity through the
+// resolver-to-spawn seam. Exact rig/polecats/name targets always name the
+// requested identity; rig/name is accepted only when it is not a crew target.
+func polecatNameForTarget(target string, allowShorthand bool, townRoot string) string {
+	_, name, ok := canonicalNamedPolecatTarget(target, allowShorthand, townRoot)
+	if !ok {
+		return ""
+	}
+	return name
+}
+
+func canonicalNamedPolecatTarget(target string, allowShorthand bool, townRoot string) (string, string, bool) {
+	parts := strings.Split(target, "/")
+	if len(parts) >= 3 && parts[0] != "" && strings.EqualFold(parts[1], "polecats") && parts[2] != "" {
+		return strings.ToLower(parts[0]), strings.ToLower(parts[2]), true
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		if _, ok := missingPolecatTargetRig(target, allowShorthand, townRoot); ok {
+			return strings.ToLower(parts[0]), strings.ToLower(parts[1]), true
+		}
+	}
+	return "", "", false
+}
+
+func canonicalPolecatPathExists(townRoot, rigName, polecatName string) (bool, error) {
+	if townRoot == "" {
+		townRoot = detectTownRootFromCwd()
+	}
+	if townRoot == "" {
+		return false, fmt.Errorf("town root is unavailable while resolving named polecat %s/%s", rigName, polecatName)
+	}
+	info, err := os.Stat(filepath.Join(townRoot, rigName, "polecats", polecatName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking named polecat %s/%s: %w", rigName, polecatName, err)
+	}
+	return info.IsDir(), nil
 }
