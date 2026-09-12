@@ -339,21 +339,39 @@ func missingPolecatTargetRig(target string, allowShorthand bool, townRoot string
 	if len(parts) >= 3 && strings.EqualFold(parts[1], "polecats") {
 		return strings.ToLower(parts[0]), true
 	}
-	if !allowShorthand {
-		return "", false
-	}
 	if len(parts) != 2 || knownRoles[strings.ToLower(parts[1])] {
 		return "", false
 	}
+	rigName := strings.ToLower(parts[0])
+	polecatName := strings.ToLower(parts[1])
 	if townRoot == "" {
 		townRoot = detectTownRootFromCwd()
 	}
 	if townRoot != "" {
-		if info, err := os.Stat(filepath.Join(townRoot, strings.ToLower(parts[0]), "crew", strings.ToLower(parts[1]))); err == nil && info.IsDir() {
+		crewInfo, err := os.Stat(filepath.Join(townRoot, rigName, "crew", polecatName))
+		if err == nil && crewInfo.IsDir() {
+			return "", false
+		}
+		if err != nil && !os.IsNotExist(err) {
 			return "", false
 		}
 	}
-	return strings.ToLower(parts[0]), true
+	if !allowShorthand {
+		if townRoot == "" {
+			return "", false
+		}
+		polecatInfo, err := os.Stat(filepath.Join(townRoot, rigName, "polecats", polecatName))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", false
+			}
+			return "", false
+		}
+		if !polecatInfo.IsDir() {
+			return "", false
+		}
+	}
+	return rigName, true
 }
 
 // polecatNameForTarget preserves an explicit polecat identity through the

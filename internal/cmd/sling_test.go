@@ -1525,6 +1525,88 @@ func TestResolveTargetCreateSpawnsPolecatShorthandWhenPaneMissing(t *testing.T) 
 	}
 }
 
+func TestResolveTargetReusesExistingNamedPolecatShorthandWithoutCreate(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "polecats", "toast"), 0755); err != nil {
+		t.Fatalf("mkdir existing named polecat: %v", err)
+	}
+
+	prevResolve := resolveTargetAgentFn
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		resolveTargetAgentFn = prevResolve
+		spawnPolecatForSling = prevSpawn
+	})
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "", "", "", errors.New("getting pane for gt-toast: exit status 1")
+	}
+
+	var gotRig string
+	var gotOpts SlingSpawnOptions
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		gotRig = rigName
+		gotOpts = opts
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: slingSpawnPolecatName(opts),
+			ClonePath:   filepath.Join(townRoot, "gastown", "polecats", "toast"),
+		}, nil
+	}
+
+	resolved, err := resolveTarget("GASTOWN/TOAST", ResolveTargetOptions{
+		TownRoot: townRoot,
+		NoBoot:   true,
+	})
+	if err != nil {
+		t.Fatalf("resolveTarget existing named shorthand: %v", err)
+	}
+	if gotRig != "gastown" || gotOpts.Create {
+		t.Fatalf("spawn target = rig %q opts %+v, want gastown with Create=false", gotRig, gotOpts)
+	}
+	if got := slingSpawnPolecatName(gotOpts); got != "toast" {
+		t.Fatalf("PolecatName = %q, want toast", got)
+	}
+	if resolved.Agent != "gastown/polecats/toast" {
+		t.Fatalf("Agent = %q, want gastown/polecats/toast", resolved.Agent)
+	}
+}
+
+func TestResolveTargetMissingNamedPolecatShorthandRequiresCreate(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	prevResolve := resolveTargetAgentFn
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		resolveTargetAgentFn = prevResolve
+		spawnPolecatForSling = prevSpawn
+	})
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "", "", "", errors.New("getting pane for gt-toast: exit status 1")
+	}
+	spawnCalled := false
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawnCalled = true
+		return nil, errors.New("unexpected spawn")
+	}
+
+	_, err := resolveTarget("gastown/toast", ResolveTargetOptions{
+		TownRoot: townRoot,
+		NoBoot:   true,
+	})
+	if err == nil {
+		t.Fatal("missing named shorthand must require Create=true")
+	}
+	if spawnCalled {
+		t.Fatal("missing named shorthand must not dispatch spawn with Create=false")
+	}
+}
+
 func TestResolveTargetCreateDoesNotSpawnCrewShorthandWhenPaneMissing(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
@@ -5403,6 +5485,44 @@ func TestSpawnNamedPolecatReusesIdleIdentityThroughLifecycle(t *testing.T) {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("durable identity missing %q:\n%s", want, desc)
 		}
+	}
+}
+
+func TestSpawnNamedPolecatReusesSafeDoneIdentityAfterRecoveryDisposition(t *testing.T) {
+	fixture := setupNamedPolecatCurrentMainFixture(t, "idle", "clean")
+	baseRig := filepath.Join(fixture.rig.Path, "mayor", "rig")
+	preReuseSHA := strings.TrimSpace(namedPolecatCurrentMainGitOutput(t, fixture.clonePath, "rev-parse", "HEAD"))
+	recoveryRef := fmt.Sprintf("refs/recovery/%s/polecat-toast-test", fixture.rig.Name)
+	runNamedPolecatCurrentMainGit(t, baseRig, "update-ref", recoveryRef, preReuseSHA)
+	beforeRecoverySHA := strings.TrimSpace(namedPolecatCurrentMainGitOutput(t, baseRig, "rev-parse", recoveryRef))
+	if beforeRecoverySHA != preReuseSHA {
+		t.Fatalf("recovery ref = %s, want pre-reuse commit %s", beforeRecoverySHA, preReuseSHA)
+	}
+	desc, err := os.ReadFile(fixture.descPath)
+	if err != nil {
+		t.Fatalf("read named identity: %v", err)
+	}
+	desc = []byte(strings.Replace(string(desc), "agent_state: idle", "agent_state: done", 1))
+	if err := os.WriteFile(fixture.descPath, desc, 0644); err != nil {
+		t.Fatalf("write done identity: %v", err)
+	}
+
+	spawned, err := spawnNamedPolecatForSling(fixture.rig.Name, fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
+		PolecatName: "toast",
+		HookBead:    "gt-next",
+	})
+	if err != nil {
+		t.Fatalf("safe done identity must be reusable: %v", err)
+	}
+	if spawned.PolecatName != "toast" {
+		t.Fatalf("PolecatName = %q, want toast", spawned.PolecatName)
+	}
+	if spawned.ClonePath != fixture.clonePath {
+		t.Fatalf("named reuse changed clone path: got %q want %q", spawned.ClonePath, fixture.clonePath)
+	}
+	afterRecoverySHA := strings.TrimSpace(namedPolecatCurrentMainGitOutput(t, baseRig, "rev-parse", recoveryRef))
+	if afterRecoverySHA != beforeRecoverySHA {
+		t.Fatalf("recovery ref changed during reuse: before %s after %s", beforeRecoverySHA, afterRecoverySHA)
 	}
 }
 

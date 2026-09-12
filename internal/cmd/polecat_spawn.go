@@ -465,13 +465,13 @@ func spawnNamedPolecatForSling(rigName string, r *rig.Rig, polecatMgr *polecat.M
 		if err != nil {
 			return nil, fmt.Errorf("getting named polecat %s: %w", polecatName, err)
 		}
-		if polecatObj.State != polecat.StateIdle {
-			decision := polecatMgr.ReuseDecisionForPolecat(polecatName, polecatObj.State)
-			reason := decision.Reason
+		disposition := polecatMgr.WorkstateDispositionForPolecat(polecatName, polecatObj.State, polecatObj.Issue)
+		if disposition.Verdict != polecat.WorkstateVerdictSafeToNuke || !disposition.Reusable || disposition.NeedsRecovery {
+			reason := disposition.Reason
 			if reason == "" {
-				reason = "state=" + string(polecatObj.State)
+				reason = "verdict=" + disposition.Verdict
 			}
-			return nil, fmt.Errorf("%w: named polecat %s is not idle (%s)", polecat.ErrPolecatNeedsRecovery, polecatName, reason)
+			return nil, fmt.Errorf("%w: named polecat %s is not reusable (%s)", polecat.ErrPolecatNeedsRecovery, polecatName, reason)
 		}
 
 		agentProfile := strings.TrimSpace(opts.Agent)
