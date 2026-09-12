@@ -1852,7 +1852,8 @@ func TestAddRig_UpstreamURL(t *testing.T) {
 
 	rig, err := manager.AddRig(AddRigOptions{
 		Name:          "forkrig",
-		GitURL:        forkURL,
+		GitURL:        upstreamURL,
+		PushURL:       forkURL,
 		UpstreamURL:   upstreamURL,
 		BeadsPrefix:   "fk",
 		SkipDoltCheck: true,
@@ -1882,6 +1883,28 @@ func TestAddRig_UpstreamURL(t *testing.T) {
 		}
 		if got != upstreamURL {
 			t.Errorf("mayor upstream = %q, want %q", got, upstreamURL)
+		}
+	})
+
+	t.Run("bare repo has fetch-capable fork remote", func(t *testing.T) {
+		bareGit := git.NewGitWithDir(filepath.Join(rigPath, ".repo.git"), "")
+		got, err := bareGit.RemoteURL("fork")
+		if err != nil {
+			t.Fatalf("fork remote: %v", err)
+		}
+		if got != forkURL {
+			t.Errorf("bare fork fetch URL = %q, want %q", got, forkURL)
+		}
+	})
+
+	t.Run("mayor clone has fetch-capable fork remote", func(t *testing.T) {
+		mayorGit := git.NewGit(filepath.Join(rigPath, "mayor", "rig"))
+		got, err := mayorGit.RemoteURL("fork")
+		if err != nil {
+			t.Fatalf("fork remote: %v", err)
+		}
+		if got != forkURL {
+			t.Errorf("mayor fork fetch URL = %q, want %q", got, forkURL)
 		}
 	})
 

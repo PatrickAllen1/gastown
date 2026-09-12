@@ -485,6 +485,9 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		if err := bareGit.ConfigurePushURL("origin", opts.PushURL); err != nil {
 			return nil, fmt.Errorf("configuring push URL: %w", err)
 		}
+		if err := configureFetchCapableFork(bareGit, opts.PushURL); err != nil {
+			return nil, fmt.Errorf("configuring fetch-capable fork: %w", err)
+		}
 		fmt.Printf("   ✓ Configured push URL (fork: %s)\n", util.RedactURL(opts.PushURL)) // fmt.Printf matches AddRig's established success output pattern
 	}
 
@@ -564,6 +567,9 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if opts.PushURL != "" {
 		if err := mayorGit.ConfigurePushURL("origin", opts.PushURL); err != nil {
 			return nil, fmt.Errorf("configuring mayor push URL: %w", err)
+		}
+		if err := configureFetchCapableFork(mayorGit, opts.PushURL); err != nil {
+			return nil, fmt.Errorf("configuring fetch-capable fork on mayor: %w", err)
 		}
 	}
 	// Configure upstream remote on mayor clone (separate clone, doesn't inherit from bare repo)
@@ -1731,11 +1737,17 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 			if cfgErr := bareGit.ConfigurePushURL("origin", pushURL); cfgErr != nil {
 				return nil, fmt.Errorf("configuring push URL on bare repo: %w", cfgErr)
 			}
+			if cfgErr := configureFetchCapableFork(bareGit, pushURL); cfgErr != nil {
+				return nil, fmt.Errorf("configuring fetch-capable fork on bare repo: %w", cfgErr)
+			}
 		}
 		if _, err := os.Stat(mayorRigPath); err == nil {
 			mayorGit := git.NewGit(mayorRigPath)
 			if cfgErr := mayorGit.ConfigurePushURL("origin", pushURL); cfgErr != nil {
 				return nil, fmt.Errorf("configuring mayor push URL: %w", cfgErr)
+			}
+			if cfgErr := configureFetchCapableFork(mayorGit, pushURL); cfgErr != nil {
+				return nil, fmt.Errorf("configuring fetch-capable fork on mayor: %w", cfgErr)
 			}
 		}
 	} else if pushURLAuthoritative {
@@ -1817,6 +1829,40 @@ func (m *Manager) detectPushURL(rigPath string) string {
 		}
 	}
 	return ""
+}
+
+// configureFetchCapableFork makes an explicit PushURL available as a normal
+// fetch remote. origin keeps its upstream fetch URL and split push URL, while
+// fork provides the authenticated private branch proof required for new work.
+// Existing upstream configuration is never changed.
+func configureFetchCapableFork(g *git.Git, pushURL string) error {
+	pushURL = strings.TrimSpace(pushURL)
+	if pushURL == "" {
+		return nil
+	}
+
+	remotes, err := g.Remotes()
+	if err != nil {
+		return err
+	}
+	forkExists := false
+	for _, remote := range remotes {
+		if remote == "fork" {
+			forkExists = true
+			break
+		}
+	}
+	if forkExists {
+		if _, err := g.SetRemoteURL("fork", pushURL); err != nil {
+			return err
+		}
+		if err := g.ClearPushURL("fork"); err != nil {
+			return err
+		}
+		return nil
+	}
+	_, err = g.AddRemote("fork", pushURL)
+	return err
 }
 
 // detectPushURLFrom checks a single git repo for a custom push URL.

@@ -205,7 +205,7 @@ func parseFreshBranchName(branch string) freshBranchMeta {
 	return freshBranchMeta{polecat: meta.Polecat, issue: meta.Issue, ok: true}
 }
 
-func (m *SessionManager) canonicalSessionStartPoint(g *git.Git) string {
+func (m *SessionManager) canonicalSessionStartPoint(g *git.Git) (string, error) {
 	defaultBranch := ""
 	if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
 		defaultBranch = rigCfg.DefaultBranch
@@ -214,9 +214,16 @@ func (m *SessionManager) canonicalSessionStartPoint(g *git.Git) string {
 		defaultBranch = g.RemoteDefaultBranch()
 	}
 	if defaultBranch == "" {
-		return ""
+		return "", fmt.Errorf("%w: no default branch configured", git.ErrMissingPrivateWorkAuthority)
 	}
-	return fmt.Sprintf("origin/%s", defaultBranch)
+	authority, err := g.ResolveDefaultWorkBase(defaultBranch)
+	if err != nil {
+		return "", err
+	}
+	if err := g.RefreshWorkBase(authority); err != nil {
+		return "", err
+	}
+	return authority.Ref, nil
 }
 
 // shouldCreateFreshSessionBranch decides whether the session manager should
@@ -243,45 +250,49 @@ func shouldCreateFreshSessionBranch(currentBranch, issue, canonicalBranch string
 	return issue != "" && meta.ok
 }
 
-func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string, opts SessionStartOptions) string {
+func (m *SessionManager) ensureCanonicalSessionBranch(g *git.Git, polecat string, opts SessionStartOptions) (string, error) {
 	currentBranch, err := g.CurrentBranch()
 	if err != nil {
-		return ""
+		return "", err
 	}
 
-	startPoint := m.canonicalSessionStartPoint(g)
-	if startPoint == "" {
-		debugSession("canonical session start point unresolved", fmt.Errorf("no default branch in rig config or remote"))
-		return currentBranch
+	startPoint, err := m.canonicalSessionStartPoint(g)
+	if err != nil {
+		return "", err
 	}
-	canonicalBranch := strings.TrimPrefix(startPoint, "origin/")
+	return m.ensureCanonicalSessionBranchFromBase(g, polecat, opts, currentBranch, startPoint)
+}
+
+func (m *SessionManager) ensureCanonicalSessionBranchFromBase(g *git.Git, polecat string, opts SessionStartOptions, currentBranch, startPoint string) (string, error) {
+	if currentBranch == "" {
+		var err error
+		currentBranch, err = g.CurrentBranch()
+		if err != nil {
+			return "", err
+		}
+	}
+	canonicalBranch := startPoint
+	if _, branch, ok := strings.Cut(startPoint, "/"); ok {
+		canonicalBranch = branch
+	}
 	if !shouldCreateFreshSessionBranch(currentBranch, opts.Issue, canonicalBranch) {
-		return currentBranch
-	}
-
-	// Refresh origin refs before branching so recovered sessions start from the
-	// canonical remote base instead of any preserved local polecat branch.
-	if err := g.Fetch("origin"); err != nil {
-		debugSession("fetch origin for canonical session branch", err)
+		return currentBranch, nil
 	}
 
 	exists, err := g.RefExists(startPoint)
 	if err != nil {
-		debugSession("check canonical session start point", err)
-		return currentBranch
+		return "", fmt.Errorf("checking canonical session start point %s: %w", startPoint, err)
 	}
 	if !exists {
-		debugSession("missing canonical session start point", fmt.Errorf("%s", startPoint))
-		return currentBranch
+		return "", fmt.Errorf("canonical session start point %s not found", startPoint)
 	}
 
 	newBranch := m.freshBranchName(polecat, opts.Issue)
 	if err := g.CheckoutNewBranch(newBranch, startPoint); err != nil {
-		debugSession("auto-checkout fresh branch on canonical base", err)
-		return currentBranch
+		return "", fmt.Errorf("checking out fresh branch %s on %s: %w", newBranch, startPoint, err)
 	}
 
-	return newBranch
+	return newBranch, nil
 }
 
 // hasPolecat checks if the polecat exists in this rig.
@@ -324,6 +335,23 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	sessionID := m.SessionName(polecat)
 
+	// Resolve and authenticate the canonical work base before any stale-session
+	// cleanup or tmux/session mutation. A split public/private topology must not
+	// fail open to origin/main during session branch setup.
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = m.clonePath(polecat)
+	}
+	polecatGit := git.NewGit(workDir)
+	canonicalStartPoint := ""
+	if polecatGit.IsRepo() {
+		var baseErr error
+		canonicalStartPoint, baseErr = m.canonicalSessionStartPoint(polecatGit)
+		if baseErr != nil {
+			return fmt.Errorf("preparing canonical session work base: %w", baseErr)
+		}
+	}
+
 	// Check if session already exists.
 	// If an existing session's pane process has died, kill the stale session
 	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
@@ -350,12 +378,6 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
 			return fmt.Errorf("killing stale session %s: %w", sessionID, err)
 		}
-	}
-
-	// Determine working directory
-	workDir := opts.WorkDir
-	if workDir == "" {
-		workDir = m.clonePath(polecat)
 	}
 
 	// Validate issue exists and isn't tombstoned BEFORE creating session.
@@ -439,8 +461,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// these env vars allow branch detection and path resolution without a
 	// working directory.
 	polecatGitBranch := ""
-	if g := git.NewGit(workDir); g != nil {
-		polecatGitBranch = m.ensureCanonicalSessionBranch(g, polecat, opts)
+	if canonicalStartPoint != "" {
+		var branchErr error
+		polecatGitBranch, branchErr = m.ensureCanonicalSessionBranchFromBase(polecatGit, polecat, opts, "", canonicalStartPoint)
+		if branchErr != nil {
+			return fmt.Errorf("preparing canonical session branch: %w", branchErr)
+		}
 	}
 	// Generate the GASTA run ID — the root identifier for all telemetry emitted
 	// by this polecat session and its subprocesses (bd, mail, …).

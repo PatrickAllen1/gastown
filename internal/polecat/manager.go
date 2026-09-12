@@ -584,6 +584,37 @@ func (m *Manager) repoBase() (*git.Git, error) {
 	return git.NewGit(mayorPath), nil
 }
 
+// configuredDefaultBranch returns the rig's configured default branch, with
+// main as the compatibility fallback used by the existing rig schema.
+func (m *Manager) configuredDefaultBranch() string {
+	if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
+		return rigCfg.DefaultBranch
+	}
+	return "main"
+}
+
+// prepareDefaultWorkBase resolves and refreshes the authenticated default work
+// base before any polecat pool, name, directory, worktree, bead, or session
+// mutation. Explicit BaseBranch and ResumeBranch remain caller-authoritative
+// and intentionally bypass this resolver.
+func (m *Manager) prepareDefaultWorkBase(opts AddOptions) (string, error) {
+	if opts.BaseBranch != "" || opts.ResumeBranch != "" {
+		return "", nil
+	}
+	repoGit, err := m.repoBase()
+	if err != nil {
+		return "", fmt.Errorf("finding repo base: %w", err)
+	}
+	authority, err := repoGit.ResolveDefaultWorkBase(m.configuredDefaultBranch())
+	if err != nil {
+		return "", err
+	}
+	if err := repoGit.RefreshWorkBase(authority); err != nil {
+		return "", err
+	}
+	return authority.Ref, nil
+}
+
 // polecatDir returns the parent directory for a polecat.
 // This is polecats/<name>/ - the polecat's home directory.
 func (m *Manager) polecatDir(name string) string {
@@ -765,6 +796,10 @@ func (m *Manager) Add(name string) (*Polecat, error) {
 // (GH#2215) by holding the pool lock through directory creation, ensuring
 // no concurrent process can allocate the same name.
 func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
+	preparedBase, err := m.prepareDefaultWorkBase(opts)
+	if err != nil {
+		return "", nil, err
+	}
 	if _, err := m.resolveRuntimeConfig(opts.AgentProfile); err != nil {
 		return "", nil, err
 	}
@@ -820,7 +855,7 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 	// Continue with the rest of AddWithOptions under the polecat lock only.
 	// addWithOptionsLocked expects the polecat directory to already exist
 	// and the polecat lock to be held by the caller.
-	p, err := m.addWithOptionsLocked(name, opts, polecatDir)
+	p, err := m.addWithOptionsLocked(name, opts, polecatDir, preparedBase)
 	_ = polecatLock.Unlock()
 	if err != nil {
 		return "", nil, err
@@ -831,7 +866,7 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 // addWithOptionsLocked performs the expensive parts of polecat creation
 // (worktree, beads, settings) after the directory has been created.
 // Caller MUST hold the polecat lock and have already created polecatDir.
-func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir string) (_ *Polecat, retErr error) {
+func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir, preparedBase string) (_ *Polecat, retErr error) {
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
 	runtimeConfig, err := m.resolveRuntimeConfig(opts.AgentProfile)
 	if err != nil {
@@ -873,8 +908,10 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		return nil, fmt.Errorf("finding repo base: %w", err)
 	}
 
-	if err := repoGit.Fetch("origin"); err != nil {
-		style.PrintWarning("could not fetch origin: %v", err)
+	if opts.BaseBranch != "" || opts.ResumeBranch != "" {
+		if err := repoGit.Fetch("origin"); err != nil {
+			style.PrintWarning("could not fetch origin: %v", err)
+		}
 	}
 
 	if opts.ResumeBranch != "" {
@@ -894,11 +931,10 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		if opts.BaseBranch != "" {
 			startPoint = opts.BaseBranch
 		} else {
-			defaultBranch := "main"
-			if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
-				defaultBranch = rigCfg.DefaultBranch
+			startPoint = preparedBase
+			if startPoint == "" {
+				return nil, fmt.Errorf("default work base was not prepared before polecat mutation")
 			}
-			startPoint = fmt.Sprintf("origin/%s", defaultBranch)
 		}
 
 		if exists, err := repoGit.RefExists(startPoint); err != nil {
@@ -992,6 +1028,14 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 // cross-beads routing issues when slinging work to new polecats.
 func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retErr error) {
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
+	// Authenticate and refresh the default base before acquiring any polecat
+	// lock or touching an AllocateName reservation. A caller may have already
+	// allocated this name; an authority failure must preserve that exact marker
+	// and pool state for the caller to retry or release explicitly.
+	preparedBase, err := m.prepareDefaultWorkBase(opts)
+	if err != nil {
+		return nil, err
+	}
 	// Acquire per-polecat file lock to prevent concurrent Add/Remove/Repair races
 	fl, err := m.lockPolecat(name)
 	if err != nil {
@@ -1075,10 +1119,15 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 		return nil, fmt.Errorf("finding repo base: %w", err)
 	}
 
-	// Fetch latest from origin to ensure worktree starts from up-to-date code
-	if err := repoGit.Fetch("origin"); err != nil {
-		// Non-fatal - proceed with potentially stale code
-		style.PrintWarning("could not fetch origin: %v", err)
+	// Explicit branch workflows retain their historical origin refresh. Default
+	// work has already fetched and verified the selected authority in the
+	// preflight above; fetching origin here could only refresh a non-authoritative
+	// public ref and obscure which base was actually selected.
+	if opts.BaseBranch != "" || opts.ResumeBranch != "" {
+		if err := repoGit.Fetch("origin"); err != nil {
+			// Non-fatal - proceed with potentially stale code
+			style.PrintWarning("could not fetch origin: %v", err)
+		}
 	}
 
 	if opts.ResumeBranch != "" {
@@ -1100,11 +1149,11 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 		if opts.BaseBranch != "" {
 			startPoint = opts.BaseBranch
 		} else {
-			defaultBranch := "main"
-			if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
-				defaultBranch = rigCfg.DefaultBranch
+			startPoint = preparedBase
+			if startPoint == "" {
+				cleanupOnError()
+				return nil, fmt.Errorf("default work base was not prepared before polecat mutation")
 			}
-			startPoint = fmt.Sprintf("origin/%s", defaultBranch)
 		}
 
 		// Validate that startPoint ref exists before attempting worktree creation
@@ -1663,6 +1712,10 @@ func (m *Manager) RepairWorktree(name string, force bool) (*Polecat, error) {
 // Allows setting hook_bead atomically at repair time.
 // After repair, uses new structure: polecats/<name>/<rigname>/
 func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOptions) (*Polecat, error) {
+	preparedBase, err := m.prepareDefaultWorkBase(opts)
+	if err != nil {
+		return nil, err
+	}
 	// Acquire per-polecat file lock to prevent concurrent Repair/Remove races
 	fl, err := m.lockPolecat(name)
 	if err != nil {
@@ -1696,8 +1749,11 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		}
 	}
 
-	// Fetch latest from origin to ensure we have fresh commits (non-fatal: may be offline)
-	_ = repoGit.Fetch("origin")
+	// Explicit branch workflows retain their historical origin refresh. The
+	// default authority was fetched and verified before entering repair.
+	if opts.BaseBranch != "" || opts.ResumeBranch != "" {
+		_ = repoGit.Fetch("origin")
+	}
 
 	// Ensure polecat directory exists for new structure
 	if err := os.MkdirAll(polecatDir, 0755); err != nil {
@@ -1729,11 +1785,10 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		if opts.BaseBranch != "" {
 			startPoint = opts.BaseBranch
 		} else {
-			defaultBranch := "main"
-			if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
-				defaultBranch = rigCfg.DefaultBranch
+			startPoint = preparedBase
+			if startPoint == "" {
+				return nil, fmt.Errorf("default work base was not prepared before polecat mutation")
 			}
-			startPoint = fmt.Sprintf("origin/%s", defaultBranch)
 		}
 
 		// Validate that startPoint ref exists before attempting worktree creation
@@ -1876,6 +1931,14 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 //  4. Reset agent bead and set hook_bead atomically
 //  5. Return polecat in working state
 func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, error) {
+	var preparedBase string
+	if opts.BaseBranch == "" && opts.ResumeBranch == "" {
+		var err error
+		preparedBase, err = m.prepareDefaultWorkBase(opts)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if m.tmux != nil {
 		sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
 		if _, err := probePolecatSession(m.tmux, sessionName); err != nil {
@@ -1954,13 +2017,17 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	polecatGit := git.NewGit(clonePath)
 
-	// Fetch latest from origin (non-fatal: may be offline)
+	// Refresh refs for explicit branch workflows. Default work has already been
+	// resolved and fetched by prepareDefaultWorkBase before any reuse/session
+	// mutation, and must never fall back to origin/main.
 	repoGit, err := m.repoBase()
-	if err == nil {
+	if err == nil && (opts.BaseBranch != "" || opts.ResumeBranch != "") {
 		_ = repoGit.Fetch("origin")
 	}
 	// Also fetch in the worktree itself so it has the latest refs
-	_ = polecatGit.Fetch("origin")
+	if opts.BaseBranch != "" || opts.ResumeBranch != "" {
+		_ = polecatGit.Fetch("origin")
+	}
 
 	// Determine the start point for the new branch.
 	// When resuming an existing branch (gh#3602), the start point IS that branch's
@@ -1982,11 +2049,10 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	case opts.BaseBranch != "":
 		startPoint = opts.BaseBranch
 	default:
-		defaultBranch := "main"
-		if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
-			defaultBranch = rigCfg.DefaultBranch
+		startPoint = preparedBase
+		if startPoint == "" {
+			return nil, fmt.Errorf("default work base was not prepared before polecat mutation")
 		}
-		startPoint = fmt.Sprintf("origin/%s", defaultBranch)
 	}
 
 	// Validate that startPoint ref exists

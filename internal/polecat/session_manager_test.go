@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -361,7 +362,10 @@ func TestEnsureCanonicalSessionBranch_UsesOriginDefaultBranch(t *testing.T) {
 	}
 
 	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
-	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
 	if !strings.Contains(branch, "/gt-9qb+") {
 		t.Fatalf("fresh session branch = %q, want issue-scoped branch", branch)
 	}
@@ -392,9 +396,51 @@ func TestEnsureCanonicalSessionBranch_KeepsCurrentIssueBranch(t *testing.T) {
 	}
 
 	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
-	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	branch, err := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if err != nil {
+		t.Fatalf("ensureCanonicalSessionBranch: %v", err)
+	}
 	if branch != currentBranch {
 		t.Fatalf("ensureCanonicalSessionBranch changed active issue branch: got %q want %q", branch, currentBranch)
+	}
+}
+
+func TestEnsureCanonicalSessionBranch_SplitAuthorityFailsClosed(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+	privatePush := filepath.Join(t.TempDir(), "private.git")
+	if out, err := exec.Command("git", "init", "--bare", privatePush).CombinedOutput(); err != nil {
+		t.Fatalf("init private remote: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", workDir, "remote", "set-url", "origin", "--push", privatePush).CombinedOutput(); err != nil {
+		t.Fatalf("set private push URL: %v\n%s", err, out)
+	}
+	if err := repoGit.CheckoutNewBranch("polecat/toast-old", "main"); err != nil {
+		t.Fatalf("checkout stale polecat branch: %v", err)
+	}
+	beforeBranch, err := repoGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("current branch before: %v", err)
+	}
+	beforeHead, err := repoGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("HEAD before: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	_, err = sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-private"})
+	if !errors.Is(err, git.ErrMissingPrivateWorkAuthority) {
+		t.Fatalf("ensureCanonicalSessionBranch error = %v, want ErrMissingPrivateWorkAuthority", err)
+	}
+	afterBranch, branchErr := repoGit.CurrentBranch()
+	if branchErr != nil {
+		t.Fatalf("current branch after: %v", branchErr)
+	}
+	afterHead, headErr := repoGit.Rev("HEAD")
+	if headErr != nil {
+		t.Fatalf("HEAD after: %v", headErr)
+	}
+	if afterBranch != beforeBranch || afterHead != beforeHead {
+		t.Fatalf("strict authority failure mutated worktree: before %s/%s after %s/%s", beforeBranch, beforeHead, afterBranch, afterHead)
 	}
 }
 

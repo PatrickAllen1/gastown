@@ -1514,6 +1514,221 @@ func TestAddWithOptions_UsesCanonicalOriginDefaultBranch(t *testing.T) {
 	}
 }
 
+func TestAddWithOptions_UsesAuthenticatedPrivateForkDefaultBranch(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	privateBare := filepath.Join(t.TempDir(), "private.git")
+	if out, err := exec.Command("git", "clone", "--bare", mayorRig, privateBare).CombinedOutput(); err != nil {
+		t.Fatalf("clone private bare: %v\n%s", err, out)
+	}
+
+	// Advance only the private fork so the stale public/upstream ref cannot
+	// accidentally satisfy the ancestry assertion.
+	seed := filepath.Join(t.TempDir(), "seed")
+	if out, err := exec.Command("git", "clone", mayorRig, seed).CombinedOutput(); err != nil {
+		t.Fatalf("clone private seed: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{{"config", "user.email", "test@test.com"}, {"config", "user.name", "Test"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = seed
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(seed, "private-only.txt"), []byte("private\n"), 0644); err != nil {
+		t.Fatalf("write private commit: %v", err)
+	}
+	for _, args := range [][]string{{"add", "private-only.txt"}, {"commit", "-m", "advance private main"}, {"remote", "set-url", "origin", privateBare}, {"push", "origin", "main"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = seed
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.ConfigurePushURL("origin", privateBare); err != nil {
+		t.Fatalf("configure origin push URL: %v", err)
+	}
+	if _, err := mayorGit.AddRemote("fork", privateBare); err != nil {
+		t.Fatalf("add fork remote: %v", err)
+	}
+	privateTip, err := mayorGit.RemoteBranchTip("fork", "main")
+	if err != nil {
+		t.Fatalf("private fork tip: %v", err)
+	}
+
+	polecat, err := mgr.AddWithOptions("private-toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	worktreeGit := git.NewGit(polecat.ClonePath)
+	gotTip, err := worktreeGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("worktree HEAD: %v", err)
+	}
+	if gotTip != privateTip {
+		t.Fatalf("new polecat HEAD = %s, want authenticated fork tip %s", gotTip, privateTip)
+	}
+	if _, err := os.Stat(filepath.Join(polecat.ClonePath, "private-only.txt")); err != nil {
+		t.Fatalf("private fork file missing from new worktree: %v", err)
+	}
+}
+
+func TestDefaultWorkAuthorityFailurePrecedesPolecatArtifacts(t *testing.T) {
+	methods := []struct {
+		name string
+		call func(*Manager) error
+	}{
+		{name: "allocate", call: func(m *Manager) error {
+			_, _, err := m.AllocateAndAdd(AddOptions{})
+			return err
+		}},
+		{name: "add", call: func(m *Manager) error {
+			_, err := m.AddWithOptions("toast", AddOptions{})
+			return err
+		}},
+		{name: "repair", call: func(m *Manager) error {
+			_, err := m.RepairWorktreeWithOptions("toast", true, AddOptions{})
+			return err
+		}},
+		{name: "reuse", call: func(m *Manager) error {
+			_, err := m.ReuseIdlePolecat("toast", AddOptions{})
+			return err
+		}},
+	}
+
+	for _, method := range methods {
+		t.Run(method.name, func(t *testing.T) {
+			mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+			privatePush := filepath.Join(t.TempDir(), "private-push.git")
+			if out, err := exec.Command("git", "init", "--bare", privatePush).CombinedOutput(); err != nil {
+				t.Fatalf("init private push remote: %v\n%s", err, out)
+			}
+			if out, err := exec.Command("git", "-C", mayorRig, "remote", "set-url", "origin", "--push", privatePush).CombinedOutput(); err != nil {
+				t.Fatalf("set private push URL: %v\n%s", err, out)
+			}
+
+			beforePolecats, err := os.ReadDir(filepath.Join(mgr.rig.Path, "polecats"))
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("read polecats before: %v", err)
+			}
+			beforeWorktrees := strings.TrimSpace(runManagerGitOutput(t, mayorRig, "worktree", "list", "--porcelain"))
+
+			err = method.call(mgr)
+			if !errors.Is(err, git.ErrMissingPrivateWorkAuthority) {
+				t.Fatalf("%s error = %v, want ErrMissingPrivateWorkAuthority", method.name, err)
+			}
+			afterPolecats, readErr := os.ReadDir(filepath.Join(mgr.rig.Path, "polecats"))
+			if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatalf("read polecats after: %v", readErr)
+			}
+			if len(afterPolecats) != len(beforePolecats) {
+				t.Fatalf("%s created polecat artifacts: before=%v after=%v", method.name, beforePolecats, afterPolecats)
+			}
+			afterWorktrees := strings.TrimSpace(runManagerGitOutput(t, mayorRig, "worktree", "list", "--porcelain"))
+			if afterWorktrees != beforeWorktrees {
+				t.Fatalf("%s changed worktree registrations", method.name)
+			}
+		})
+	}
+}
+
+func TestAddWithOptions_AuthorityFailurePreservesReservationState(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	privatePush := filepath.Join(t.TempDir(), "private-push.git")
+	if out, err := exec.Command("git", "init", "--bare", privatePush).CombinedOutput(); err != nil {
+		t.Fatalf("init private push remote: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", mayorRig, "remote", "set-url", "origin", "--push", privatePush).CombinedOutput(); err != nil {
+		t.Fatalf("set private push URL: %v\n%s", err, out)
+	}
+
+	name, err := mgr.AllocateName()
+	if err != nil {
+		t.Fatalf("AllocateName: %v", err)
+	}
+	pendingPath := mgr.pendingPath(name)
+	beforePending, err := os.ReadFile(pendingPath)
+	if err != nil {
+		t.Fatalf("read pending marker before: %v", err)
+	}
+	beforePool, err := os.ReadFile(mgr.namePool.stateFile)
+	if err != nil {
+		t.Fatalf("read pool state before: %v", err)
+	}
+	beforeNames := append([]string(nil), mgr.namePool.ActiveNames()...)
+	lockDir := filepath.Join(mgr.rig.Path, ".runtime", "locks")
+	beforeLocks, err := os.ReadDir(lockDir)
+	if err != nil {
+		t.Fatalf("read lock dir before: %v", err)
+	}
+	beforePolecats, err := os.ReadDir(filepath.Join(mgr.rig.Path, "polecats"))
+	if err != nil {
+		t.Fatalf("read polecat dir before: %v", err)
+	}
+	beforeWorktrees := runManagerGitOutput(t, mayorRig, "worktree", "list", "--porcelain")
+	beforeRefs := runManagerGitOutput(t, mayorRig, "show-ref")
+
+	_, err = mgr.AddWithOptions(name, AddOptions{})
+	if !errors.Is(err, git.ErrMissingPrivateWorkAuthority) {
+		t.Fatalf("AddWithOptions error = %v, want ErrMissingPrivateWorkAuthority", err)
+	}
+
+	afterPending, err := os.ReadFile(pendingPath)
+	if err != nil {
+		t.Fatalf("read pending marker after: %v", err)
+	}
+	if string(afterPending) != string(beforePending) {
+		t.Fatalf("pending marker changed: before=%q after=%q", beforePending, afterPending)
+	}
+	afterPool, err := os.ReadFile(mgr.namePool.stateFile)
+	if err != nil {
+		t.Fatalf("read pool state after: %v", err)
+	}
+	if string(afterPool) != string(beforePool) {
+		t.Fatalf("pool state changed: before=%q after=%q", beforePool, afterPool)
+	}
+	if got := mgr.namePool.ActiveNames(); strings.Join(got, "\x00") != strings.Join(beforeNames, "\x00") {
+		t.Fatalf("active names changed: before=%v after=%v", beforeNames, got)
+	}
+	afterLocks, err := os.ReadDir(lockDir)
+	if err != nil {
+		t.Fatalf("read lock dir after: %v", err)
+	}
+	if len(afterLocks) != len(beforeLocks) {
+		t.Fatalf("lock artifacts changed: before=%v after=%v", beforeLocks, afterLocks)
+	}
+	for i := range beforeLocks {
+		if beforeLocks[i].Name() != afterLocks[i].Name() {
+			t.Fatalf("lock artifacts changed: before=%v after=%v", beforeLocks, afterLocks)
+		}
+	}
+	afterPolecats, err := os.ReadDir(filepath.Join(mgr.rig.Path, "polecats"))
+	if err != nil {
+		t.Fatalf("read polecat dir after: %v", err)
+	}
+	if len(afterPolecats) != len(beforePolecats) || afterPolecats[0].Name() != beforePolecats[0].Name() {
+		t.Fatalf("polecat artifacts changed: before=%v after=%v", beforePolecats, afterPolecats)
+	}
+	if afterWorktrees := runManagerGitOutput(t, mayorRig, "worktree", "list", "--porcelain"); afterWorktrees != beforeWorktrees {
+		t.Fatalf("worktree registrations changed: before=%q after=%q", beforeWorktrees, afterWorktrees)
+	}
+	if afterRefs := runManagerGitOutput(t, mayorRig, "show-ref"); afterRefs != beforeRefs {
+		t.Fatalf("refs changed: before=%q after=%q", beforeRefs, afterRefs)
+	}
+}
+
+func runManagerGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return string(out)
+}
+
 func TestAllocateAndAdd_RunsWispSetupCommand(t *testing.T) {
 	mgr, _ := setupCanonicalBranchManagerTest(t)
 	writeWispSetupCommand(t, mgr, setupCommandWriteMarker("setup-marker"))
@@ -2242,9 +2457,9 @@ func TestAddWithOptions_RollbackReleasesName(t *testing.T) {
 		t.Fatalf("git commit: %v", err)
 	}
 
-	// Add origin remote pointing to a nonexistent path so that fetch fails
-	// and origin/main is never created. This causes AddWithOptions to fail at
-	// ref validation, testing rollback.
+	// Add origin remote pointing to a nonexistent path so that fetch fails.
+	// The explicit base below intentionally bypasses default-work authority and
+	// exercises the historical rollback path at ref validation.
 	cmd = exec.Command("git", "remote", "add", "origin", "/nonexistent/repo")
 	cmd.Dir = mayorRig
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -2269,8 +2484,9 @@ func TestAddWithOptions_RollbackReleasesName(t *testing.T) {
 		t.Fatal("expected at least 1 active name after AllocateName")
 	}
 
-	// Try to create polecat — should fail because origin/main doesn't exist
-	_, err = m.AddWithOptions(name, AddOptions{})
+	// Try to create polecat — should fail because the explicit origin/main ref
+	// doesn't exist.
+	_, err = m.AddWithOptions(name, AddOptions{BaseBranch: "origin/main"})
 	if err == nil {
 		t.Fatal("AddWithOptions should have failed without origin/main ref")
 	}
@@ -2684,10 +2900,10 @@ func TestReuseIdlePolecat_KillsLiveSession(t *testing.T) {
 		t.Fatal("precondition: heartbeat should exist")
 	}
 
-	// Call ReuseIdlePolecat — it will kill the session, then fail on worktree
-	// operations (no real git repo). The important thing is it does NOT return
-	// ErrSessionRunning.
-	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+	// Explicit bases bypass default-work authority, so this legacy recovery
+	// scenario still kills the session before failing on missing worktree
+	// operations. The strict default path is covered separately below.
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{BaseBranch: "HEAD"})
 
 	// Verify it did NOT return ErrSessionRunning (the old buggy behavior)
 	if errors.Is(reuseErr, ErrSessionRunning) {
@@ -2713,6 +2929,96 @@ func TestReuseIdlePolecat_KillsLiveSession(t *testing.T) {
 	// Verify heartbeat was cleaned up
 	if hb := ReadSessionHeartbeat(townRoot, sessionName); hb != nil {
 		t.Error("heartbeat should have been removed after session kill")
+	}
+}
+
+func TestReuseIdlePolecat_DefaultAuthorityFailurePreservesState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux not supported on Windows")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testreuseauthority"
+	rigPath := filepath.Join(townRoot, rigName)
+	polecatName := "toast"
+	polecatDir := filepath.Join(rigPath, "polecats", polecatName)
+	if err := os.MkdirAll(polecatDir, 0755); err != nil {
+		t.Fatalf("mkdir polecat dir: %v", err)
+	}
+	cleanupMarker := targetCleanCounterFile(polecatDir)
+	if err := os.WriteFile(cleanupMarker, []byte("7"), 0644); err != nil {
+		t.Fatalf("write cleanup marker: %v", err)
+	}
+
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", rigName)
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	r := &rig.Rig{Name: rigName, Path: rigPath}
+	mgr := NewManager(r, git.NewGit(rigPath), tm)
+	sessionName := NewSessionManager(tm, r).SessionName(polecatName)
+	if err := tm.NewSessionWithCommand(sessionName, townRoot, "sleep 300"); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(sessionName) })
+	TouchSessionHeartbeat(townRoot, sessionName)
+
+	beforeMarker, err := os.ReadFile(cleanupMarker)
+	if err != nil {
+		t.Fatalf("read cleanup marker before: %v", err)
+	}
+	heartbeatPath := filepath.Join(townRoot, ".runtime", "heartbeats", sessionName+".json")
+	beforeHeartbeat, err := os.ReadFile(heartbeatPath)
+	if err != nil {
+		t.Fatalf("read heartbeat before: %v", err)
+	}
+	beforeEntries, err := os.ReadDir(polecatDir)
+	if err != nil {
+		t.Fatalf("read polecat dir before: %v", err)
+	}
+	lockDir := filepath.Join(rigPath, ".runtime", "locks")
+	if _, err := os.Stat(lockDir); !os.IsNotExist(err) {
+		t.Fatalf("lock dir precondition: err=%v", err)
+	}
+
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+	if reuseErr == nil {
+		t.Fatal("default reuse without a repository should fail before mutation")
+	}
+
+	running, err := tm.HasSession(sessionName)
+	if err != nil || !running {
+		t.Fatalf("session changed after authority failure: running=%v err=%v", running, err)
+	}
+	afterHeartbeat, err := os.ReadFile(heartbeatPath)
+	if err != nil {
+		t.Fatalf("read heartbeat after: %v", err)
+	}
+	if string(afterHeartbeat) != string(beforeHeartbeat) {
+		t.Fatalf("heartbeat changed after authority failure: before=%q after=%q", beforeHeartbeat, afterHeartbeat)
+	}
+	afterMarker, err := os.ReadFile(cleanupMarker)
+	if err != nil {
+		t.Fatalf("read cleanup marker after: %v", err)
+	}
+	if string(afterMarker) != string(beforeMarker) {
+		t.Fatalf("cleanup marker changed after authority failure: before=%q after=%q", beforeMarker, afterMarker)
+	}
+	afterEntries, err := os.ReadDir(polecatDir)
+	if err != nil {
+		t.Fatalf("read polecat dir after: %v", err)
+	}
+	if len(afterEntries) != len(beforeEntries) || afterEntries[0].Name() != beforeEntries[0].Name() {
+		t.Fatalf("polecat directory changed after authority failure: before=%v after=%v", beforeEntries, afterEntries)
+	}
+	if _, err := os.Stat(lockDir); !os.IsNotExist(err) {
+		t.Fatalf("lock dir created after authority failure: err=%v", err)
 	}
 }
 
@@ -2851,7 +3157,9 @@ func TestReuseIdlePolecat_KillsStaleSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+	// Explicit bases retain the legacy recovery behavior even when this
+	// fixture has no repository from which to resolve a default authority.
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{BaseBranch: "HEAD"})
 
 	// Should not return ErrSessionRunning
 	if errors.Is(reuseErr, ErrSessionRunning) {
@@ -2902,7 +3210,7 @@ func TestReuseIdlePolecat_NoSessionNoop(t *testing.T) {
 	mgr := NewManager(r, git.NewGit(rigPath), tm)
 
 	// No tmux session, no heartbeat — the common idle case
-	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{})
+	_, reuseErr := mgr.ReuseIdlePolecat(polecatName, AddOptions{BaseBranch: "HEAD"})
 
 	// Should not return ErrSessionRunning
 	if errors.Is(reuseErr, ErrSessionRunning) {

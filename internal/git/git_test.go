@@ -2792,6 +2792,262 @@ func initTestRepoWithSplitRemote(t *testing.T) (string, string, string, string) 
 	return localDir, upstream, fork, mainBranch
 }
 
+// initPrivateWorkAuthorityRepo creates a split fetch/push topology with an
+// explicit fetch-capable fork remote. URL rewrite rules keep the fixture
+// entirely local while exercising the SSH/HTTPS canonicalization path.
+func initPrivateWorkAuthorityRepo(t *testing.T) (string, string, string, string) {
+	t.Helper()
+	localDir, upstream, fork, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	if _, err := g.AddRemote("fork", "git@github.com:private/example.git"); err != nil {
+		t.Fatalf("add fork remote: %v", err)
+	}
+	if err := g.ClearPushURL("origin"); err != nil {
+		t.Fatalf("clear origin push URL: %v", err)
+	}
+	if _, err := g.SetRemoteURL("origin", "https://github.com/public/example.git"); err != nil {
+		t.Fatalf("set origin fetch URL: %v", err)
+	}
+	if err := g.ConfigurePushURL("origin", "git@github.com:private/example.git"); err != nil {
+		t.Fatalf("set origin push URL: %v", err)
+	}
+	if _, err := g.SetRemoteURL("fork", "https://github.com/private/example.git"); err != nil {
+		t.Fatalf("set fork fetch URL: %v", err)
+	}
+	if err := g.ConfigurePushURL("fork", "git@github.com:private/example.git"); err != nil {
+		t.Fatalf("set fork push URL: %v", err)
+	}
+	for _, rewrite := range []struct{ base, instead string }{
+		{base: upstream, instead: "https://github.com/public/example.git"},
+		{base: fork, instead: "https://github.com/private/example.git"},
+		{base: fork, instead: "git@github.com:private/example.git"},
+	} {
+		cmd := exec.Command("git", "config", "--add", "url."+rewrite.base+".insteadOf", rewrite.instead)
+		cmd.Dir = localDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("configure URL rewrite %q: %v\n%s", rewrite.instead, err, out)
+		}
+	}
+	return localDir, upstream, fork, mainBranch
+}
+
+func TestResolveDefaultWorkBase_PublicOnlyUsesOrigin(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	authority, err := g.ResolveDefaultWorkBase(mainBranch)
+	if err != nil {
+		t.Fatalf("ResolveDefaultWorkBase: %v", err)
+	}
+	if authority.Remote != "origin" {
+		t.Fatalf("authority remote = %q, want origin", authority.Remote)
+	}
+	if authority.Ref != "origin/"+mainBranch {
+		t.Fatalf("authority ref = %q, want origin/%s", authority.Ref, mainBranch)
+	}
+	if authority.URLs.FetchURL == "" || authority.URLs.PushURL == "" {
+		t.Fatalf("authority URLs = %+v, want fetch and push URLs", authority.URLs)
+	}
+	if err := g.RefreshWorkBase(authority); err != nil {
+		t.Fatalf("RefreshWorkBase: %v", err)
+	}
+	got, err := g.Rev(authority.Ref)
+	if err != nil {
+		t.Fatalf("resolve refreshed base: %v", err)
+	}
+	if got == "" {
+		t.Fatal("refreshed base tip is empty")
+	}
+}
+
+func TestResolveDefaultWorkBase_SplitPushAloneFailsClosed(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithSplitRemote(t)
+	if _, err := NewGit(localDir).ResolveDefaultWorkBase(mainBranch); !errors.Is(err, ErrMissingPrivateWorkAuthority) {
+		t.Fatalf("ResolveDefaultWorkBase error = %v, want ErrMissingPrivateWorkAuthority", err)
+	}
+}
+
+func TestResolveDefaultWorkBase_MatchingForkSSHHTTPS(t *testing.T) {
+	localDir, _, _, mainBranch := initPrivateWorkAuthorityRepo(t)
+	g := NewGit(localDir)
+
+	authority, err := g.ResolveDefaultWorkBase(mainBranch)
+	if err != nil {
+		t.Fatalf("ResolveDefaultWorkBase: %v", err)
+	}
+	if authority.Remote != "fork" {
+		t.Fatalf("authority remote = %q, want fork", authority.Remote)
+	}
+	if authority.Ref != "fork/"+mainBranch {
+		t.Fatalf("authority ref = %q, want fork/%s", authority.Ref, mainBranch)
+	}
+	if err := g.RefreshWorkBase(authority); err != nil {
+		t.Fatalf("RefreshWorkBase: %v", err)
+	}
+	if got, err := g.Rev(authority.Ref); err != nil || got == "" {
+		t.Fatalf("refreshed fork base = %q, err=%v", got, err)
+	}
+}
+
+func TestResolveDefaultWorkBase_StaleOriginUsesNewerFork(t *testing.T) {
+	localDir, upstream, _, mainBranch := initPrivateWorkAuthorityRepo(t)
+	g := NewGit(localDir)
+	originTip, err := g.RemoteBranchTip("origin", mainBranch)
+	if err != nil {
+		t.Fatalf("origin tip: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(localDir, "private-main.txt"), []byte("private\n"), 0644); err != nil {
+		t.Fatalf("write private commit: %v", err)
+	}
+	for _, args := range [][]string{{"add", "private-main.txt"}, {"commit", "-m", "advance private main"}, {"push", "fork", mainBranch}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = localDir
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, runErr, out)
+		}
+	}
+
+	authority, err := g.ResolveDefaultWorkBase(mainBranch)
+	if err != nil {
+		t.Fatalf("ResolveDefaultWorkBase: %v", err)
+	}
+	if authority.Remote != "fork" {
+		t.Fatalf("authority remote = %q, want fork", authority.Remote)
+	}
+	if authority.Tip == originTip {
+		t.Fatalf("authority tip = %s, want newer than stale origin tip %s", authority.Tip, originTip)
+	}
+	if err := g.RefreshWorkBase(authority); err != nil {
+		t.Fatalf("RefreshWorkBase: %v", err)
+	}
+	if got, err := g.Rev(authority.Ref); err != nil || got != authority.Tip {
+		t.Fatalf("fetched fork tip = %q, authority tip = %q, err=%v", got, authority.Tip, err)
+	}
+	if got, err := g.RemoteBranchTip("origin", mainBranch); err != nil || got != originTip {
+		t.Fatalf("origin tip changed unexpectedly: got %q want %q from %s, err=%v", got, originTip, upstream, err)
+	}
+}
+
+func TestResolveDefaultWorkBase_MissingForkMainFailsClosed(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	missingFork := filepath.Join(t.TempDir(), "missing-fork.git")
+	if err := exec.Command("git", "init", "--bare", missingFork).Run(); err != nil {
+		t.Fatalf("init missing fork: %v", err)
+	}
+	if _, err := g.AddRemote("fork", missingFork); err != nil {
+		t.Fatalf("add missing fork remote: %v", err)
+	}
+	if err := g.ConfigurePushURL("origin", missingFork); err != nil {
+		t.Fatalf("configure origin push URL: %v", err)
+	}
+	if _, err := g.ResolveDefaultWorkBase(mainBranch); !errors.Is(err, ErrMissingPrivateWorkAuthority) {
+		t.Fatalf("ResolveDefaultWorkBase error = %v, want ErrMissingPrivateWorkAuthority", err)
+	}
+}
+
+func TestResolveDefaultWorkBase_MismatchedForkIsAmbiguous(t *testing.T) {
+	localDir, _, _, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	wrongFork := filepath.Join(t.TempDir(), "wrong-fork.git")
+	if err := exec.Command("git", "init", "--bare", wrongFork).Run(); err != nil {
+		t.Fatalf("init wrong fork: %v", err)
+	}
+	if _, err := g.AddRemote("fork", wrongFork); err != nil {
+		t.Fatalf("add wrong fork remote: %v", err)
+	}
+	if err := g.ConfigurePushURL("origin", filepath.Join(t.TempDir(), "private-target.git")); err != nil {
+		t.Fatalf("configure origin push URL: %v", err)
+	}
+	if _, err := g.ResolveDefaultWorkBase(mainBranch); !errors.Is(err, ErrAmbiguousWorkAuthority) {
+		t.Fatalf("ResolveDefaultWorkBase error = %v, want ErrAmbiguousWorkAuthority", err)
+	}
+}
+
+func TestResolveDefaultWorkBase_MultipleMatchingForksAreAmbiguous(t *testing.T) {
+	localDir, _, fork, mainBranch := initPrivateWorkAuthorityRepo(t)
+	g := NewGit(localDir)
+	if _, err := g.AddRemote("private", "git@github.com:private/example.git"); err != nil {
+		t.Fatalf("add second fork remote: %v", err)
+	}
+	if _, err := g.SetRemoteURL("private", "https://github.com/private/example.git"); err != nil {
+		t.Fatalf("set second fork fetch URL: %v", err)
+	}
+	if err := g.ConfigurePushURL("private", fork); err != nil {
+		t.Fatalf("set second fork push URL: %v", err)
+	}
+	if _, err := g.ResolveDefaultWorkBase(mainBranch); !errors.Is(err, ErrAmbiguousWorkAuthority) {
+		t.Fatalf("ResolveDefaultWorkBase error = %v, want ErrAmbiguousWorkAuthority", err)
+	}
+}
+
+func TestRefreshWorkBase_FetchedTipRaceFailsClosed(t *testing.T) {
+	localDir, _, fork, mainBranch := initPrivateWorkAuthorityRepo(t)
+	g := NewGit(localDir)
+	authority, err := g.ResolveDefaultWorkBase(mainBranch)
+	if err != nil {
+		t.Fatalf("ResolveDefaultWorkBase: %v", err)
+	}
+	if err := g.RefreshWorkBase(authority); err != nil {
+		t.Fatalf("initial RefreshWorkBase: %v", err)
+	}
+	trackingRef := "refs/remotes/" + authority.Remote + "/" + authority.Branch
+	trackingTip, err := g.Rev(trackingRef)
+	if err != nil {
+		t.Fatalf("tracking tip before race: %v", err)
+	}
+	trackingBytes, err := g.run("show-ref", "--verify", trackingRef)
+	if err != nil {
+		t.Fatalf("tracking bytes before race: %v", err)
+	}
+	provenTip := authority.Tip
+
+	seed := filepath.Join(t.TempDir(), "race-seed")
+	if out, err := exec.Command("git", "clone", fork, seed).CombinedOutput(); err != nil {
+		t.Fatalf("clone race seed: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{{"config", "user.email", "test@test.com"}, {"config", "user.name", "Test"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = seed
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, runErr, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(seed, "race.txt"), []byte("advanced\n"), 0644); err != nil {
+		t.Fatalf("write advanced commit: %v", err)
+	}
+	for _, args := range [][]string{{"add", "race.txt"}, {"commit", "-m", "advance private main"}, {"push", "origin", mainBranch}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = seed
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, runErr, out)
+		}
+	}
+
+	err = g.RefreshWorkBase(authority)
+	if !errors.Is(err, ErrAmbiguousWorkAuthority) {
+		t.Fatalf("RefreshWorkBase error = %v, want ErrAmbiguousWorkAuthority", err)
+	}
+	if authority.Tip != provenTip {
+		t.Fatalf("authority tip changed after race: got %s want proven %s", authority.Tip, provenTip)
+	}
+	afterTrackingTip, err := g.Rev(trackingRef)
+	if err != nil {
+		t.Fatalf("tracking tip after race: %v", err)
+	}
+	if afterTrackingTip != trackingTip {
+		t.Fatalf("tracking tip changed after rejected race: got %s want %s", afterTrackingTip, trackingTip)
+	}
+	afterTrackingBytes, err := g.run("show-ref", "--verify", trackingRef)
+	if err != nil {
+		t.Fatalf("tracking bytes after race: %v", err)
+	}
+	if afterTrackingBytes != trackingBytes {
+		t.Fatalf("tracking ref bytes changed after rejected race: got %q want %q", afterTrackingBytes, trackingBytes)
+	}
+}
+
 func TestForkBackedDefaultPushGuard_SplitPushURL(t *testing.T) {
 	localDir, _, _, mainBranch := initTestRepoWithSplitRemote(t)
 	g := NewGit(localDir)

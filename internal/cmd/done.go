@@ -665,6 +665,35 @@ func init() {
 	rootCmd.AddCommand(doneCmd)
 }
 
+// resolveDoneDefaultWorkBase authenticates and refreshes the default branch
+// before gt done can write cleanup, checkpoint, heartbeat, or bead state. An
+// explicit target deliberately retains the existing clean-base behavior and
+// does not require default-branch authority.
+func resolveDoneDefaultWorkBase(g *git.Git, defaultBranch, explicitTarget string) (*git.WorkBaseAuthority, error) {
+	if strings.TrimSpace(explicitTarget) != "" {
+		return nil, nil
+	}
+	authority, err := g.ResolveDefaultWorkBase(defaultBranch)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.RefreshWorkBase(authority); err != nil {
+		return nil, err
+	}
+	return authority, nil
+}
+
+// refreshDoneContaminationBase refreshes the base used by the contamination
+// and auto-rebase checks. A strict default authority must be refreshed through
+// RefreshWorkBase so a fork tip race fails closed; explicit targets retain the
+// historical best-effort fetch behavior.
+func refreshDoneContaminationBase(g *git.Git, authority *git.WorkBaseAuthority, contaminationBase, fetchRemote string) (bool, error) {
+	if authority != nil && contaminationBase == authority.Ref {
+		return true, g.RefreshWorkBase(authority)
+	}
+	return false, g.Fetch(fetchRemote)
+}
+
 func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	defer func() { telemetry.RecordDone(context.Background(), strings.ToUpper(doneStatus), retErr) }()
 	// Guard: Only polecats should call gt done
@@ -700,6 +729,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	branch, err := g.CurrentBranch()
 	if err != nil {
 		return fmt.Errorf("getting current branch: %w", err)
+	}
+
+	// Resolve the default work authority before any cleanup, done-intent,
+	// checkpoint, heartbeat, or auto-commit mutation. Explicit MR targets keep
+	// their existing clean-base semantics; the default target must be proven
+	// against the authenticated private fork when origin has split fetch/push
+	// URLs.
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	defaultAuthority, err := resolveDoneDefaultWorkBase(g, defaultBranch, doneTarget)
+	if err != nil {
+		return fmt.Errorf("preparing default work base: %w", err)
 	}
 
 	// Auto-detect cleanup status if not explicitly provided
@@ -939,12 +982,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
 	}
 
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
-	}
 	baseRef := g.CleanBaseRef("origin", defaultBranch, doneTarget)
+	if defaultAuthority != nil {
+		baseRef = defaultAuthority.Ref
+	}
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
@@ -983,6 +1024,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// rigs this is upstream/main, not the fork's origin/main.
 		aheadCount, err := g.CommitsAhead(baseRef, "HEAD")
 		if err != nil {
+			if defaultAuthority != nil {
+				return fmt.Errorf("checking commits ahead of authenticated base %s: %w", baseRef, err)
+			}
 			// Fallback to local branch comparison if origin not available
 			aheadCount, err = g.CommitsAhead(defaultBranch, branch)
 			if err != nil {
@@ -1135,9 +1179,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		fetchRemote := git.RemoteForRef(contaminationBase)
 		if fetchRemote == "" {
-			fetchRemote = "origin"
+			if defaultAuthority != nil && contaminationBase == defaultAuthority.Ref {
+				fetchRemote = defaultAuthority.Remote
+			} else {
+				fetchRemote = "origin"
+			}
 		}
-		if fetchErr := g.Fetch(fetchRemote); fetchErr != nil {
+		strictRefresh, fetchErr := refreshDoneContaminationBase(g, defaultAuthority, contaminationBase, fetchRemote)
+		if strictRefresh && fetchErr != nil {
+			// Re-prove and refresh the authenticated default base immediately
+			// before contamination/rebase. A generic fetch here could advance
+			// fork/main after the authority proof and silently change the clean
+			// base used for the rest of gt done. RefreshWorkBase fetches into
+			// FETCH_HEAD, verifies the exact proven tip, and only then updates
+			// the tracking ref; a raced tip therefore fails closed.
+			return fmt.Errorf("refreshing authenticated contamination base %s: %w", contaminationBase, fetchErr)
+		} else if !strictRefresh && fetchErr != nil {
 			style.PrintWarning("could not fetch %s before contamination check: %v (proceeding with local refs)", fetchRemote, fetchErr)
 		}
 		contam, err := g.CheckBranchContamination(contaminationBase)
@@ -1747,6 +1804,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// Capture current clean target HEAD as the verified base.
 				// The polecat rebased onto this SHA before running gates.
 				verifiedBaseRef := g.CleanBaseRef("origin", defaultBranch, target)
+				if defaultAuthority != nil && target == defaultBranch {
+					verifiedBaseRef = defaultAuthority.Ref
+				}
 				if verifiedBase, baseErr := g.Rev(verifiedBaseRef); baseErr == nil {
 					description += fmt.Sprintf("\npre_verified_base: %s", verifiedBase)
 				} else {

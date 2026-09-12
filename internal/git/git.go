@@ -19,6 +19,44 @@ import (
 
 var errNoComparisonRefs = errors.New("no comparison refs resolved")
 
+// ErrMissingPrivateWorkAuthority means a split fetch/push remote has no
+// authenticated, fetch-capable private fork that can prove the requested
+// default branch. Callers must fail before creating any work artifacts.
+var ErrMissingPrivateWorkAuthority = errors.New("MISSING_PRIVATE_WORK_AUTHORITY")
+
+// ErrAmbiguousWorkAuthority means the configured remotes do not identify one
+// unambiguous private work base (for example, multiple matching forks or a
+// remote that changed between proof and fetch).
+var ErrAmbiguousWorkAuthority = errors.New("AMBIGUOUS_WORK_AUTHORITY")
+
+// RemoteURLs contains the effective fetch and push URLs for one remote.
+// PushURL is the fetch URL when the remote has no explicit pushurl entry.
+type RemoteURLs struct {
+	FetchURL string
+	PushURL  string
+}
+
+// WorkBaseAuthority is the authenticated default-branch work base selected by
+// ResolveDefaultWorkBase. Ref is the local remote-tracking ref callers should
+// use after RefreshWorkBase succeeds. Tip is the exact remote tip proven at
+// resolution time; split push/fetch topologies must still match it after the
+// fetch to close the proof/fetch race window.
+type WorkBaseAuthority struct {
+	Remote string
+	Branch string
+	Ref    string
+	Tip    string
+	URLs   RemoteURLs
+
+	// Aliases make the authority self-describing to callers that need the
+	// canonical ref or the origin topology in diagnostics.
+	BaseRef       string
+	RemoteName    string
+	RemoteURLs    RemoteURLs
+	DefaultBranch string
+	HeadSHA       string
+}
+
 // GitError contains raw output from a git command for agent observation.
 // ZFC: Callers observe the raw output and decide what to do.
 // The error interface methods provide human-readable messages, but agents
@@ -1019,6 +1057,298 @@ func (g *Git) CleanBaseRef(remote, defaultBranch, target string) string {
 		return target
 	}
 	return remote + "/" + target
+}
+
+// RemoteURLs returns the effective fetch and push URLs for remote. Git's
+// remote get-url --push command returns the fetch URL when no explicit
+// pushurl is configured, which is exactly the distinction work-base
+// resolution needs.
+func (g *Git) RemoteURLs(remote string) (RemoteURLs, error) {
+	// Read the configured values directly instead of remote get-url: Git applies
+	// url.*.insteadOf rewrites to the latter, which would hide the configured
+	// SSH/HTTPS identity that authority matching must canonicalize itself.
+	fetchURL, err := g.ConfigGet("remote." + remote + ".url")
+	if err != nil || strings.TrimSpace(fetchURL) == "" {
+		fetchURL, err = g.RemoteURL(remote)
+		if err != nil {
+			return RemoteURLs{}, err
+		}
+	}
+	pushURL, pushErr := g.ConfigGet("remote." + remote + ".pushurl")
+	if pushErr != nil || strings.TrimSpace(pushURL) == "" {
+		pushURL = fetchURL
+	}
+	return RemoteURLs{
+		FetchURL: strings.TrimSpace(fetchURL),
+		PushURL:  strings.TrimSpace(pushURL),
+	}, nil
+}
+
+// ResolveDefaultWorkBase determines the only authority that may seed a new
+// worktree from the configured default branch. A public-only origin (fetch and
+// effective push URL equal) remains compatible with the historical
+// origin/<branch> base. When origin fetches public upstream but pushes to a
+// private fork, the fork must be an explicit remote with a matching canonical
+// fetch URL and must prove that its HEAD is the requested default branch.
+//
+// This function performs no local ref mutation. Call RefreshWorkBase before
+// creating any worktree, branch, pool, bead, or session artifacts.
+func (g *Git) ResolveDefaultWorkBase(defaultBranch string) (*WorkBaseAuthority, error) {
+	defaultBranch = strings.TrimSpace(defaultBranch)
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+
+	originURLs, err := g.RemoteURLs("origin")
+	if err != nil {
+		return nil, fmt.Errorf("%w: origin remote is unavailable: %v", ErrMissingPrivateWorkAuthority, err)
+	}
+
+	// A remote whose effective push URL equals its fetch URL is public-only.
+	// Do not let a local main branch or a push-only URL override this choice.
+	if sameGitRemoteURL(originURLs.FetchURL, originURLs.PushURL) {
+		return newWorkBaseAuthority("origin", defaultBranch, originURLs, ""), nil
+	}
+
+	remotes, err := g.Remotes()
+	if err != nil {
+		return nil, fmt.Errorf("%w: listing remotes: %v", ErrAmbiguousWorkAuthority, err)
+	}
+	var candidates []string
+	var explicitRemotes []string
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		// origin is the split public/upstream remote. upstream is deliberately
+		// preserved for upstream tracking and is never a private work base.
+		if remote == "" || remote == "origin" || remote == "upstream" {
+			continue
+		}
+		urls, urlsErr := g.RemoteURLs(remote)
+		if urlsErr != nil || strings.TrimSpace(urls.FetchURL) == "" {
+			continue
+		}
+		explicitRemotes = append(explicitRemotes, remote)
+		if sameGitRemoteURL(urls.FetchURL, originURLs.PushURL) {
+			candidates = append(candidates, remote)
+		}
+	}
+
+	if len(candidates) == 0 {
+		if len(explicitRemotes) > 0 {
+			return nil, fmt.Errorf("%w: explicit fork remotes %s do not match origin push target %s", ErrAmbiguousWorkAuthority, strings.Join(explicitRemotes, ", "), util.RedactURL(originURLs.PushURL))
+		}
+		return nil, fmt.Errorf("%w: origin pushes to %s but no explicit fetch-capable fork remote matches it", ErrMissingPrivateWorkAuthority, util.RedactURL(originURLs.PushURL))
+	}
+	if len(candidates) != 1 {
+		return nil, fmt.Errorf("%w: %d explicit fork remotes match origin push target %s (%s)", ErrAmbiguousWorkAuthority, len(candidates), util.RedactURL(originURLs.PushURL), strings.Join(candidates, ", "))
+	}
+
+	forkRemote := candidates[0]
+	tip, err := g.proveRemoteWorkBase(forkRemote, defaultBranch)
+	if err != nil {
+		return nil, err
+	}
+	authority := newWorkBaseAuthority(forkRemote, defaultBranch, originURLs, tip)
+	return authority, nil
+}
+
+func newWorkBaseAuthority(remote, branch string, urls RemoteURLs, tip string) *WorkBaseAuthority {
+	ref := remote + "/" + branch
+	return &WorkBaseAuthority{
+		Remote:        remote,
+		Branch:        branch,
+		Ref:           ref,
+		Tip:           strings.TrimSpace(tip),
+		URLs:          urls,
+		BaseRef:       ref,
+		RemoteName:    remote,
+		RemoteURLs:    urls,
+		DefaultBranch: branch,
+		HeadSHA:       strings.TrimSpace(tip),
+	}
+}
+
+// RefreshWorkBase fetches exactly the proven default branch into the selected
+// remote-tracking ref and verifies that the fetched tip still matches the
+// authenticated remote proof. A tip change between ls-remote and fetch is an
+// authority race and fails closed as AMBIGUOUS_WORK_AUTHORITY.
+func (g *Git) RefreshWorkBase(authority *WorkBaseAuthority) error {
+	if authority == nil {
+		return fmt.Errorf("%w: nil work-base authority", ErrAmbiguousWorkAuthority)
+	}
+	remote := strings.TrimSpace(authority.Remote)
+	if remote == "" {
+		remote = strings.TrimSpace(authority.RemoteName)
+	}
+	branch := strings.TrimSpace(authority.Branch)
+	if branch == "" {
+		branch = strings.TrimSpace(authority.DefaultBranch)
+	}
+	if remote == "" || branch == "" {
+		return fmt.Errorf("%w: incomplete work-base authority", ErrAmbiguousWorkAuthority)
+	}
+
+	originURLs, err := g.RemoteURLs("origin")
+	if err != nil {
+		return fmt.Errorf("%w: origin remote changed or is unavailable: %v", ErrAmbiguousWorkAuthority, err)
+	}
+	expectedURLs := authority.URLs
+	if expectedURLs.FetchURL == "" && expectedURLs.PushURL == "" {
+		expectedURLs = authority.RemoteURLs
+	}
+	if expectedURLs.PushURL != "" && !sameGitRemoteURL(expectedURLs.PushURL, originURLs.PushURL) {
+		return fmt.Errorf("%w: origin push target changed from %s to %s", ErrAmbiguousWorkAuthority, util.RedactURL(expectedURLs.PushURL), util.RedactURL(originURLs.PushURL))
+	}
+	if expectedURLs.FetchURL != "" && !sameGitRemoteURL(expectedURLs.FetchURL, originURLs.FetchURL) {
+		return fmt.Errorf("%w: origin fetch target changed from %s to %s", ErrAmbiguousWorkAuthority, util.RedactURL(expectedURLs.FetchURL), util.RedactURL(originURLs.FetchURL))
+	}
+
+	if remote == "origin" {
+		if !sameGitRemoteURL(originURLs.FetchURL, originURLs.PushURL) {
+			return fmt.Errorf("%w: split origin remote cannot use origin/%s as default work base", ErrAmbiguousWorkAuthority, branch)
+		}
+	} else {
+		urls, urlsErr := g.RemoteURLs(remote)
+		if urlsErr != nil || !sameGitRemoteURL(urls.FetchURL, originURLs.PushURL) {
+			return fmt.Errorf("%w: fork remote %s no longer matches origin push target", ErrAmbiguousWorkAuthority, remote)
+		}
+		if candidates, candidatesErr := g.matchingWorkBaseRemotes(originURLs.PushURL); candidatesErr != nil {
+			return fmt.Errorf("%w: checking fork remotes: %v", ErrAmbiguousWorkAuthority, candidatesErr)
+		} else if len(candidates) != 1 || candidates[0] != remote {
+			return fmt.Errorf("%w: fork authority changed; expected only %s, found %s", ErrAmbiguousWorkAuthority, remote, strings.Join(candidates, ", "))
+		}
+	}
+
+	expectedTip := strings.TrimSpace(authority.Tip)
+	if expectedTip == "" {
+		expectedTip = strings.TrimSpace(authority.HeadSHA)
+	}
+	if expectedTip == "" {
+		expectedTip, err = g.RemoteBranchTip(remote, branch)
+		if err != nil {
+			return fmt.Errorf("%w: proving %s/%s: %v", ErrMissingPrivateWorkAuthority, remote, branch, err)
+		}
+	}
+	if expectedTip == "" {
+		return fmt.Errorf("%w: %s/%s does not exist", ErrMissingPrivateWorkAuthority, remote, branch)
+	}
+	if err := g.fetchExactWorkBase(remote, branch, expectedTip); err != nil {
+		return err
+	}
+	authority.Remote = remote
+	authority.RemoteName = remote
+	authority.Branch = branch
+	authority.DefaultBranch = branch
+	authority.Ref = remote + "/" + branch
+	authority.BaseRef = authority.Ref
+	authority.Tip = expectedTip
+	authority.HeadSHA = expectedTip
+	return nil
+}
+
+func (g *Git) matchingWorkBaseRemotes(pushURL string) ([]string, error) {
+	remotes, err := g.Remotes()
+	if err != nil {
+		return nil, err
+	}
+	var matches []string
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		if remote == "" || remote == "origin" || remote == "upstream" {
+			continue
+		}
+		urls, urlsErr := g.RemoteURLs(remote)
+		if urlsErr == nil && sameGitRemoteURL(urls.FetchURL, pushURL) {
+			matches = append(matches, remote)
+		}
+	}
+	return matches, nil
+}
+
+func (g *Git) proveRemoteWorkBase(remote, branch string) (string, error) {
+	out, err := g.run("ls-remote", "--symref", remote, "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("%w: unable to prove %s HEAD: %v", ErrMissingPrivateWorkAuthority, remote, err)
+	}
+
+	wantRef := "refs/heads/" + branch
+	var headRef, headTip string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 3 && fields[0] == "ref:" && fields[2] == "HEAD" {
+			headRef = fields[1]
+		}
+		if len(fields) >= 2 && fields[1] == "HEAD" {
+			headTip = fields[0]
+		}
+	}
+	if headRef != wantRef || headTip == "" {
+		return "", fmt.Errorf("%w: %s HEAD is %q at %s, want %s", ErrMissingPrivateWorkAuthority, remote, headRef, shortSHA(headTip), wantRef)
+	}
+	branchTip, err := g.RemoteBranchTip(remote, branch)
+	if err != nil {
+		return "", fmt.Errorf("%w: unable to prove %s/%s: %v", ErrMissingPrivateWorkAuthority, remote, branch, err)
+	}
+	if branchTip == "" {
+		return "", fmt.Errorf("%w: %s/%s does not exist", ErrMissingPrivateWorkAuthority, remote, branch)
+	}
+	if branchTip != headTip {
+		return "", fmt.Errorf("%w: %s HEAD raced from %s to %s", ErrAmbiguousWorkAuthority, remote, shortSHA(headTip), shortSHA(branchTip))
+	}
+	return headTip, nil
+}
+
+func (g *Git) fetchExactWorkBase(remote, branch, expectedTip string) error {
+	ref := "refs/remotes/" + remote + "/" + branch
+	// Fetch only the requested branch into FETCH_HEAD. --refmap= prevents the
+	// remote's configured mapping from updating refs/remotes/<remote>/... before
+	// the fetched object and a fresh remote proof agree. Updating the canonical
+	// tracking ref before that proof would expose a raced authority even though
+	// this refresh fails closed.
+	refspec := "+refs/heads/" + branch
+	if _, err := g.run("fetch", "--no-tags", "--refmap=", remote, refspec); err != nil {
+		return fmt.Errorf("%w: fetching %s/%s: %v", ErrMissingPrivateWorkAuthority, remote, branch, err)
+	}
+	fetchedTip, err := g.Rev("FETCH_HEAD")
+	if err != nil {
+		return fmt.Errorf("%w: fetched FETCH_HEAD for %s/%s is unavailable: %v", ErrAmbiguousWorkAuthority, remote, branch, err)
+	}
+	if fetchedTip != expectedTip {
+		return fmt.Errorf("%w: fetched %s/%s at %s, expected proven tip %s", ErrAmbiguousWorkAuthority, remote, branch, shortSHA(fetchedTip), shortSHA(expectedTip))
+	}
+	currentTip, err := g.RemoteBranchTip(remote, branch)
+	if err != nil {
+		return fmt.Errorf("%w: unable to verify remote tip %s/%s after fetch: %v", ErrAmbiguousWorkAuthority, remote, branch, err)
+	}
+	if currentTip != expectedTip {
+		return fmt.Errorf("%w: remote %s/%s advanced from %s to %s during fetch", ErrAmbiguousWorkAuthority, remote, branch, shortSHA(expectedTip), shortSHA(currentTip))
+	}
+	if currentTip != fetchedTip {
+		return fmt.Errorf("%w: fetched %s/%s at %s but remote now proves %s", ErrAmbiguousWorkAuthority, remote, branch, shortSHA(fetchedTip), shortSHA(currentTip))
+	}
+	// Only publish the tracking ref after both the fetched object and a fresh
+	// remote proof agree with the originally authenticated tip.
+	if _, err := g.run("update-ref", ref, fetchedTip); err != nil {
+		return fmt.Errorf("%w: publishing authenticated tracking ref %s: %v", ErrAmbiguousWorkAuthority, ref, err)
+	}
+	return nil
+}
+
+// ResolveDefaultWorkBase is the package-level form for callers that prefer a
+// functional API. The method form above remains the canonical implementation.
+func ResolveDefaultWorkBase(g *Git, defaultBranch string) (*WorkBaseAuthority, error) {
+	if g == nil {
+		return nil, fmt.Errorf("%w: nil git repository", ErrAmbiguousWorkAuthority)
+	}
+	return g.ResolveDefaultWorkBase(defaultBranch)
+}
+
+// RefreshWorkBase is the package-level form of (*Git).RefreshWorkBase.
+func RefreshWorkBase(g *Git, authority *WorkBaseAuthority) error {
+	if g == nil {
+		return fmt.Errorf("%w: nil git repository", ErrAmbiguousWorkAuthority)
+	}
+	return g.RefreshWorkBase(authority)
 }
 
 // RemoteForRef returns the remote prefix from refs like origin/main or

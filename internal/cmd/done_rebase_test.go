@@ -112,6 +112,164 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 	}
 }
 
+func TestResolveDoneDefaultWorkBase_SplitAuthorityFailsBeforeMutation(t *testing.T) {
+	tmp := t.TempDir()
+	upstream := filepath.Join(tmp, "upstream.git")
+	private := filepath.Join(tmp, "private.git")
+	repo := filepath.Join(tmp, "polecat")
+	testRunGit(t, tmp, "init", "--bare", upstream)
+	testRunGit(t, tmp, "init", "--bare", private)
+	testRunGit(t, tmp, "init", "--initial-branch", "main", repo)
+	testRunGit(t, repo, "config", "user.email", "test@test.com")
+	testRunGit(t, repo, "config", "user.name", "Test")
+	writeRepoFile(t, repo, "README.md", "# done authority\n")
+	testRunGit(t, repo, "add", "README.md")
+	testRunGit(t, repo, "commit", "-m", "initial")
+	testRunGit(t, repo, "remote", "add", "origin", upstream)
+	testRunGit(t, repo, "push", "origin", "main")
+	testRunGit(t, repo, "remote", "set-url", "origin", "--push", private)
+
+	g := gitpkg.NewGit(repo)
+	beforeBranch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch before: %v", err)
+	}
+	beforeHead, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("HEAD before: %v", err)
+	}
+	if _, err := resolveDoneDefaultWorkBase(g, "main", ""); !errors.Is(err, gitpkg.ErrMissingPrivateWorkAuthority) {
+		t.Fatalf("resolveDoneDefaultWorkBase error = %v, want ErrMissingPrivateWorkAuthority", err)
+	}
+	afterBranch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch after: %v", err)
+	}
+	afterHead, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("HEAD after: %v", err)
+	}
+	if afterBranch != beforeBranch || afterHead != beforeHead {
+		t.Fatalf("authority failure mutated done worktree: before %s/%s after %s/%s", beforeBranch, beforeHead, afterBranch, afterHead)
+	}
+
+	if authority, err := resolveDoneDefaultWorkBase(g, "main", "feature"); err != nil || authority != nil {
+		t.Fatalf("explicit target should bypass default authority: authority=%v err=%v", authority, err)
+	}
+}
+
+func TestDoneContaminationRefresh_ForkTipRaceFailsClosed(t *testing.T) {
+	tmp := t.TempDir()
+	upstream := filepath.Join(tmp, "upstream.git")
+	private := filepath.Join(tmp, "private.git")
+	repo := filepath.Join(tmp, "polecat")
+	testRunGit(t, tmp, "init", "--bare", upstream)
+	testRunGit(t, tmp, "init", "--bare", private)
+	testRunGit(t, tmp, "init", "--initial-branch", "main", repo)
+	testRunGit(t, repo, "config", "user.email", "test@test.com")
+	testRunGit(t, repo, "config", "user.name", "Test")
+	writeRepoFile(t, repo, "README.md", "# done race\n")
+	testRunGit(t, repo, "add", "README.md")
+	testRunGit(t, repo, "commit", "-m", "initial")
+	testRunGit(t, repo, "remote", "add", "origin", upstream)
+	testRunGit(t, repo, "push", "origin", "main")
+	testRunGit(t, repo, "push", private, "main")
+	testRunGit(t, repo, "remote", "set-url", "origin", "--push", private)
+	testRunGit(t, repo, "remote", "add", "fork", private)
+	testRunGit(t, private, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	g := gitpkg.NewGit(repo)
+	authority, err := resolveDoneDefaultWorkBase(g, "main", "")
+	if err != nil {
+		t.Fatalf("resolve default work base: %v", err)
+	}
+	if authority == nil || authority.Ref != "fork/main" {
+		t.Fatalf("authority = %+v, want fork/main", authority)
+	}
+	trackingRef := "refs/remotes/fork/main"
+	trackingTip, err := g.Rev(trackingRef)
+	if err != nil {
+		t.Fatalf("tracking tip before race: %v", err)
+	}
+	trackingBytes := doneGuardGitOutput(t, repo, "show-ref", "--verify", trackingRef)
+	beforeRefs := doneGuardGitOutput(t, repo, "show-ref")
+	beforeWorktrees := doneGuardGitOutput(t, repo, "worktree", "list", "--porcelain")
+	beforeBranch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("branch before race: %v", err)
+	}
+	beforeHead, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("HEAD before race: %v", err)
+	}
+	provenTip := authority.Tip
+
+	seed := filepath.Join(tmp, "race-seed")
+	testRunGit(t, tmp, "clone", private, seed)
+	testRunGit(t, seed, "config", "user.email", "test@test.com")
+	testRunGit(t, seed, "config", "user.name", "Test")
+	writeRepoFile(t, seed, "race.txt", "advanced\n")
+	testRunGit(t, seed, "add", "race.txt")
+	testRunGit(t, seed, "commit", "-m", "advance private main")
+	testRunGit(t, seed, "push", "origin", "main")
+	newForkTip, err := g.RemoteBranchTip("fork", "main")
+	if err != nil {
+		t.Fatalf("fork tip after race: %v", err)
+	}
+	if newForkTip == provenTip {
+		t.Fatalf("fork tip did not advance: still %s", provenTip)
+	}
+
+	strictRefresh, err := refreshDoneContaminationBase(g, authority, authority.Ref, authority.Remote)
+	if !strictRefresh {
+		t.Fatal("default authority should use strict contamination refresh")
+	}
+	if !errors.Is(err, gitpkg.ErrAmbiguousWorkAuthority) {
+		t.Fatalf("post-proof refresh error = %v, want ErrAmbiguousWorkAuthority", err)
+	}
+	if authority.Tip != provenTip {
+		t.Fatalf("authority tip changed after rejected race: got %s want %s", authority.Tip, provenTip)
+	}
+	afterTrackingTip, err := g.Rev(trackingRef)
+	if err != nil {
+		t.Fatalf("tracking tip after race: %v", err)
+	}
+	if afterTrackingTip != trackingTip {
+		t.Fatalf("tracking tip changed after rejected post-proof race: got %s want %s", afterTrackingTip, trackingTip)
+	}
+	if afterTrackingBytes := doneGuardGitOutput(t, repo, "show-ref", "--verify", trackingRef); afterTrackingBytes != trackingBytes {
+		t.Fatalf("tracking ref bytes changed after rejected post-proof race: got %q want %q", afterTrackingBytes, trackingBytes)
+	}
+	if afterRefs := doneGuardGitOutput(t, repo, "show-ref"); afterRefs != beforeRefs {
+		t.Fatalf("refs changed after rejected post-proof race: before=%q after=%q", beforeRefs, afterRefs)
+	}
+	if afterWorktrees := doneGuardGitOutput(t, repo, "worktree", "list", "--porcelain"); afterWorktrees != beforeWorktrees {
+		t.Fatalf("worktree registrations changed after rejected post-proof race")
+	}
+	afterBranch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("branch after race: %v", err)
+	}
+	afterHead, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("HEAD after race: %v", err)
+	}
+	if afterBranch != beforeBranch || afterHead != beforeHead {
+		t.Fatalf("worktree mutated after rejected post-proof race: before %s/%s after %s/%s", beforeBranch, beforeHead, afterBranch, afterHead)
+	}
+	for _, artifact := range []string{
+		filepath.Join(tmp, ".runtime"),
+		filepath.Join(tmp, "polecats"),
+		filepath.Join(tmp, "namepool"),
+		filepath.Join(repo, ".git", "rebase-merge"),
+		filepath.Join(repo, ".git", "rebase-apply"),
+	} {
+		if _, statErr := os.Stat(artifact); !os.IsNotExist(statErr) {
+			t.Fatalf("unexpected artifact after rejected post-proof race %s: %v", artifact, statErr)
+		}
+	}
+}
+
 // TestAutoRebaseOnTarget_ConflictAborts verifies that a rebase failure causes
 // AbortRebase to fire and the returned error includes remediation guidance.
 func TestAutoRebaseOnTarget_ConflictAborts(t *testing.T) {
