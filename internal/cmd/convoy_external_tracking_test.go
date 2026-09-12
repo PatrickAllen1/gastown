@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -471,5 +472,203 @@ func TestCloseConvoyIfComplete_UnknownBlocksAutoClose(t *testing.T) {
 	}
 	if !strings.Contains(out, "unknown") {
 		t.Fatalf("diagnostic missing 'unknown' label: %q", out)
+	}
+}
+
+// TestRunConvoyListJSONProjectsExistingLifecycle ensures that the list JSON
+// projection carries the same ownership/lifecycle contract as convoy status.
+// Lifecycle is derived from the existing gt:owned label; it is not a new bead
+// field. This is intentionally red on the pre-repair native list schema.
+func TestRunConvoyListJSONProjectsExistingLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+
+	townRoot, expectedWD := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
+
+	// Keep the fixture's tracked issue in a routed worker rig so list and
+	// status exercise the same cross-rig identity path.
+	rigDir := filepath.Join(townRoot, "worker", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir routed rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(
+		`{"prefix":"hq-","path":"."}
+{"prefix":"ws-","path":"worker/mayor/rig"}
+`), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	writeExternalTrackingBdStub(t, fmt.Sprintf(`
+case "$*" in
+  "--allow-stale version")
+    echo 'bd 1.0.0'
+    exit 0
+    ;;
+  *"list --label=gt:convoy"*)
+    if [ "$PWD" != "%s" ]; then echo "wrong list cwd: $PWD" >&2; exit 1; fi
+    echo '[{"id":"hq-cv-owned","title":"Caller-owned single","status":"open","created_at":"2026-09-12T00:00:00Z","issue_type":"convoy","labels":["gt:convoy","gt:owned"]}]'
+    exit 0
+    ;;
+  *"list --json"*)
+    echo '[]'
+    exit 0
+    ;;
+  *"sql"*"dependencies"*)
+    echo '[{"depends_on_id":"ws-cross-rig"}]'
+    exit 0
+    ;;
+  *"show"*"ws-cross-rig"*)
+    echo '[{"id":"ws-cross-rig","title":"Worker issue","status":"open","issue_type":"task","labels":[]}]'
+    exit 0
+    ;;
+  *)
+    echo "unexpected bd args: $*" >&2
+    exit 1
+    ;;
+esac
+`, expectedWD))
+
+	oldJSON, oldAll, oldStatus := convoyListJSON, convoyListAll, convoyListStatus
+	convoyListJSON, convoyListAll, convoyListStatus = true, true, ""
+	t.Cleanup(func() {
+		convoyListJSON, convoyListAll, convoyListStatus = oldJSON, oldAll, oldStatus
+	})
+
+	out, err := captureConvoyStdoutErr(t, func() error {
+		return runConvoyList(nil, nil)
+	})
+	if err != nil {
+		t.Fatalf("runConvoyList: %v", err)
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("decode list JSON: %v\n%s", err, out)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one convoy row, got %d: %s", len(rows), out)
+	}
+	row := rows[0]
+	if owned, ok := row["owned"].(bool); !ok || !owned {
+		t.Fatalf("list JSON must project owned=true from gt:owned, got %#v", row["owned"])
+	}
+	if lifecycle, ok := row["lifecycle"].(string); !ok || lifecycle != "caller-managed" {
+		t.Fatalf("list JSON lifecycle = %#v, want caller-managed", row["lifecycle"])
+	}
+	if _, ok := row["closed_at"]; !ok {
+		t.Fatalf("list JSON must preserve the existing closed_at-compatible field: %#v", row)
+	}
+}
+
+// TestRunConvoyListJSONKeepsCrossRigTrackedCounts proves that the native list
+// projection retains routed tracked identities and counts instead of reducing
+// a non-empty cross-rig convoy to an indistinguishable 0/0 row.
+func TestRunConvoyListJSONKeepsCrossRigTrackedCounts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+
+	townRoot, expectedWD := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
+	rigDir := filepath.Join(townRoot, "worker", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir routed rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(
+		`{"prefix":"hq-","path":"."}
+{"prefix":"ws-","path":"worker/mayor/rig"}
+`), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	var sqlIDs strings.Builder
+	var details strings.Builder
+	sqlIDs.WriteString("[")
+	details.WriteString("[")
+	for i := 0; i < 16; i++ {
+		if i > 0 {
+			sqlIDs.WriteString(",")
+			details.WriteString(",")
+		}
+		id := fmt.Sprintf("ws-cross-%02d", i)
+		fmt.Fprintf(&sqlIDs, `{"depends_on_id":%q}`, id)
+		status := "open"
+		if i < 11 {
+			status = "closed"
+		}
+		fmt.Fprintf(&details, `{"id":%q,"title":"cross-rig %d","status":%q,"issue_type":"task","labels":[]}`, id, i, status)
+	}
+	sqlIDs.WriteString("]")
+	details.WriteString("]")
+
+	writeExternalTrackingBdStub(t, fmt.Sprintf(`
+case "$*" in
+  "--allow-stale version")
+    echo 'bd 1.0.0'
+    exit 0
+    ;;
+  *"list --label=gt:convoy"*)
+    if [ "$PWD" != "%s" ]; then echo "wrong list cwd: $PWD" >&2; exit 1; fi
+    echo '[{"id":"hq-cv-mgo6k","title":"Adversarial Work: campaign","status":"open","created_at":"2026-09-12T00:00:00Z","issue_type":"convoy","labels":["gt:convoy"]}]'
+    exit 0
+    ;;
+  *"list --json"*)
+    echo '[]'
+    exit 0
+    ;;
+  *"sql"*"dependencies"*)
+    echo '%s'
+    exit 0
+    ;;
+  *"show"*)
+    echo '%s'
+    exit 0
+    ;;
+  *)
+    echo "unexpected bd args: $*" >&2
+    exit 1
+    ;;
+esac
+`, expectedWD, sqlIDs.String(), details.String()))
+
+	oldJSON, oldAll, oldStatus := convoyListJSON, convoyListAll, convoyListStatus
+	convoyListJSON, convoyListAll, convoyListStatus = true, true, ""
+	t.Cleanup(func() {
+		convoyListJSON, convoyListAll, convoyListStatus = oldJSON, oldAll, oldStatus
+	})
+
+	out, err := captureConvoyStdoutErr(t, func() error {
+		return runConvoyList(nil, nil)
+	})
+	if err != nil {
+		t.Fatalf("runConvoyList: %v", err)
+	}
+
+	var rows []struct {
+		ID        string             `json:"id"`
+		Tracked   []trackedIssueInfo `json:"tracked"`
+		Completed int                `json:"completed"`
+		Total     int                `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("decode list JSON: %v\n%s", err, out)
+	}
+	if len(rows) != 1 || rows[0].ID != "hq-cv-mgo6k" {
+		t.Fatalf("unexpected convoy rows: %#v", rows)
+	}
+	row := rows[0]
+	if row.Total != 16 || row.Completed != 11 || len(row.Tracked) != 16 {
+		t.Fatalf("cross-rig counts = %d/%d with %d tracked, want 11/16 with 16 tracked: %#v", row.Completed, row.Total, len(row.Tracked), row)
+	}
+	seen := make(map[string]bool, len(row.Tracked))
+	for _, issue := range row.Tracked {
+		seen[issue.ID] = true
+	}
+	for i := 0; i < 16; i++ {
+		if !seen[fmt.Sprintf("ws-cross-%02d", i)] {
+			t.Errorf("tracked cross-rig identity ws-cross-%02d was lost", i)
+		}
 	}
 }

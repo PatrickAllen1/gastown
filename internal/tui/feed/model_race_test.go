@@ -1,6 +1,7 @@
 package feed
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -157,10 +158,10 @@ func TestAddEventLocked(t *testing.T) {
 	m := NewModel(nil)
 
 	tests := []struct {
-		name        string
-		event       Event
-		wantUpdate  bool
-		wantEvents  int // expected event count after this event
+		name       string
+		event      Event
+		wantUpdate bool
+		wantEvents int // expected event count after this event
 	}{
 		{
 			name: "normal event adds to feed",
@@ -223,6 +224,61 @@ func TestAddEventLocked(t *testing.T) {
 	if _, ok := m.rigs["beads"]; !ok {
 		t.Error("expected beads rig in tree")
 	}
+}
+
+// TestConvoyRefreshAndWrapperToggleRaceFree exercises the convoy error,
+// last-good state, and wrapper-detail toggle while View/fetch updates run in
+// parallel. Run with -race; this is red until convoyUpdateMsg carries errors
+// and all convoy UI state is updated under Model.mu.
+func TestConvoyRefreshAndWrapperToggleRaceFree(t *testing.T) {
+	m := NewModel(nil)
+	m.mu.Lock()
+	m.width = 100
+	m.height = 40
+	m.focusedPanel = PanelConvoy
+	m.mu.Unlock()
+
+	state := &ConvoyState{
+		InProgress: []Convoy{{
+			ID:         "hq-cv-wrapper",
+			Title:      "system task",
+			Status:     "open",
+			Completed:  0,
+			Total:      1,
+			Owned:      false,
+			OwnedKnown: true,
+			Lifecycle:  "system-managed",
+		}},
+		LastUpdate: time.Now(),
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = m.Update(convoyUpdateMsg{state: state, err: errors.New("temporary convoy refresh")})
+			}
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_ = m.View()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+		}
+	}()
+	wg.Wait()
 }
 
 // TestEventsHistoryLimit verifies that the events slice doesn't grow beyond

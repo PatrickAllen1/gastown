@@ -2146,6 +2146,9 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 			Title     string             `json:"title"`
 			Status    string             `json:"status"`
 			CreatedAt string             `json:"created_at"`
+			ClosedAt  string             `json:"closed_at"`
+			Owned     bool               `json:"owned"`
+			Lifecycle string             `json:"lifecycle"`
 			Tracked   []trackedIssueInfo `json:"tracked"`
 			Completed int                `json:"completed"`
 			Total     int                `json:"total"`
@@ -2154,8 +2157,7 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 		for _, c := range convoys {
 			tracked, err := getTrackedIssues(townBeads, c.ID)
 			if err != nil {
-				style.PrintWarning("skipping convoy %s: %v", c.ID, err)
-				continue
+				return fmt.Errorf("getting tracked issues for %s: %w", c.ID, err)
 			}
 			if tracked == nil {
 				tracked = []trackedIssueInfo{} // Ensure JSON [] not null
@@ -2166,11 +2168,19 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 					completed++
 				}
 			}
+			owned := hasLabel(c.Labels, "gt:owned")
+			lifecycle := "system-managed"
+			if owned {
+				lifecycle = "caller-managed"
+			}
 			enriched = append(enriched, convoyListEntry{
 				ID:        c.ID,
 				Title:     c.Title,
 				Status:    c.Status,
 				CreatedAt: c.CreatedAt,
+				ClosedAt:  c.ClosedAt,
+				Owned:     owned,
+				Lifecycle: lifecycle,
 				Tracked:   tracked,
 				Completed: completed,
 				Total:     len(tracked),
@@ -2279,6 +2289,7 @@ type convoyListIssue struct {
 	Title       string   `json:"title"`
 	Status      string   `json:"status"`
 	CreatedAt   string   `json:"created_at"`
+	ClosedAt    string   `json:"closed_at,omitempty"`
 	Description string   `json:"description"`
 	IssueType   string   `json:"issue_type"`
 	Labels      []string `json:"labels"`
