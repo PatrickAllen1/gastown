@@ -147,6 +147,21 @@ type Manager struct {
 	townRoot string // Computed once at construction; used by agentBeadID for deterministic IDs
 }
 
+var hasPolecatSessionFn = func(t *tmux.Tmux, sessionName string) (bool, error) {
+	return t.HasSession(sessionName)
+}
+
+func probePolecatSession(t *tmux.Tmux, sessionName string) (bool, error) {
+	if t == nil {
+		return false, nil
+	}
+	running, err := hasPolecatSessionFn(t, sessionName)
+	if err != nil && !errors.Is(err, tmux.ErrSessionNotFound) && !errors.Is(err, tmux.ErrNoServer) {
+		return false, fmt.Errorf("checking polecat session %s: %w", sessionName, err)
+	}
+	return running, nil
+}
+
 // NewManager creates a new polecat manager.
 func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
 	// Use the resolved beads directory to find where bd commands should run.
@@ -1861,6 +1876,12 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 //  4. Reset agent bead and set hook_bead atomically
 //  5. Return polecat in working state
 func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, error) {
+	if m.tmux != nil {
+		sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+		if _, err := probePolecatSession(m.tmux, sessionName); err != nil {
+			return nil, err
+		}
+	}
 	// Acquire per-polecat file lock to prevent concurrent reuse/remove races
 	fl, err := m.lockPolecat(name)
 	if err != nil {
@@ -2079,8 +2100,11 @@ func (m *Manager) killExistingPolecatSession(name, action string) error {
 	}
 
 	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
-	running, err := m.tmux.HasSession(sessionName)
-	if err != nil || !running {
+	running, err := probePolecatSession(m.tmux, sessionName)
+	if err != nil {
+		return fmt.Errorf("checking existing session %s for %s: %w", sessionName, action, err)
+	}
+	if !running {
 		return nil
 	}
 	if err := m.tmux.KillSessionWithProcesses(sessionName); err != nil {
@@ -2993,7 +3017,7 @@ func (m *Manager) polecatSessionState(name string) (running bool, stale bool) {
 	}
 
 	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
-	running, err := m.tmux.HasSession(sessionName)
+	running, err := probePolecatSession(m.tmux, sessionName)
 	if err != nil || !running {
 		return false, false
 	}

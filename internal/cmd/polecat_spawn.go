@@ -64,6 +64,18 @@ type SlingSpawnOptions struct {
 	SkipAdmission bool   // Caller already holds a polecat admission reservation
 }
 
+var hasPolecatSessionFn = func(t *tmux.Tmux, sessionName string) (bool, error) {
+	return t.HasSession(sessionName)
+}
+
+func probePolecatSession(t *tmux.Tmux, sessionName string) (bool, error) {
+	running, err := hasPolecatSessionFn(t, sessionName)
+	if err != nil && !errors.Is(err, tmux.ErrSessionNotFound) && !errors.Is(err, tmux.ErrNoServer) {
+		return false, fmt.Errorf("checking polecat session %s: %w", sessionName, err)
+	}
+	return running, nil
+}
+
 func effectivePolecatDirCap(configured int) int {
 	if configured < minPolecatDirsPerRig {
 		return minPolecatDirsPerRig
@@ -102,6 +114,9 @@ func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error)
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
 func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+	if opts.PolecatName != "" {
+		rigName = strings.ToLower(strings.TrimSpace(rigName))
+	}
 	// Find workspace
 	townRoot := opts.TownRoot
 	if townRoot == "" {
@@ -130,6 +145,16 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	polecatGit := git.NewGit(r.Path)
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
+	if opts.PolecatName != "" {
+		sessionName := polecat.NewSessionManager(t, r).SessionName(strings.ToLower(strings.TrimSpace(opts.PolecatName)))
+		running, err := probePolecatSession(t, sessionName)
+		if err != nil {
+			return nil, err
+		}
+		if running {
+			return nil, fmt.Errorf("target polecat %s/%s has an active session; pane absence is not proof of idleness", rigName, strings.ToLower(strings.TrimSpace(opts.PolecatName)))
+		}
+	}
 	if opts.Agent != "" {
 		if _, _, err := config.ResolveAgentConfigWithOverride(townRoot, r.Path, opts.Agent); err != nil {
 			return nil, fmt.Errorf("resolving agent config for %s: %w", opts.Agent, err)
@@ -412,7 +437,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 // rebranch, hook assignment, and durable profile handling remain one locked
 // lifecycle rather than a directory-only shortcut.
 func spawnNamedPolecatForSling(rigName string, r *rig.Rig, polecatMgr *polecat.Manager, t *tmux.Tmux, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
-	polecatName := strings.TrimSpace(opts.PolecatName)
+	polecatName := strings.ToLower(strings.TrimSpace(opts.PolecatName))
 	if polecatName == "" || polecatName == "." || polecatName == ".." || strings.ContainsAny(polecatName, "/\\") {
 		return nil, fmt.Errorf("invalid named polecat %q", opts.PolecatName)
 	}
@@ -424,7 +449,11 @@ func spawnNamedPolecatForSling(rigName string, r *rig.Rig, polecatMgr *polecat.M
 
 	polecatSessMgr := polecat.NewSessionManager(t, r)
 	sessionName := polecatSessMgr.SessionName(polecatName)
-	if running, err := t.HasSession(sessionName); err == nil && running {
+	running, err := probePolecatSession(t, sessionName)
+	if err != nil {
+		return nil, err
+	}
+	if running {
 		return nil, fmt.Errorf("target polecat %s/%s has an active session; pane absence is not proof of idleness", rigName, polecatName)
 	}
 
@@ -487,8 +516,14 @@ func spawnNamedPolecatForSling(rigName string, r *rig.Rig, polecatMgr *polecat.M
 			agent:             agentProfile,
 		}, nil
 	}
+	if statErr == nil && !polecatDirInfo.IsDir() {
+		return nil, fmt.Errorf("named polecat %s/%s path is not a directory", rigName, polecatName)
+	}
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return nil, fmt.Errorf("checking named polecat %s: %w", polecatName, statErr)
+	}
+	if !opts.Create {
+		return nil, fmt.Errorf("named polecat %s/%s does not exist; use --create to create it", rigName, polecatName)
 	}
 
 	agentProfile := strings.TrimSpace(opts.Agent)

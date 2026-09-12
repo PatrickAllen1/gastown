@@ -965,6 +965,7 @@ exit /b 0
 
 	prevNoConvoy := slingNoConvoy
 	prevNoBoot := slingNoBoot
+	prevCreate := slingCreate
 	prevHookRaw := slingHookRawBead
 	prevSpawn := spawnPolecatForSling
 	prevResolveTargetAgent := resolveTargetAgentFn
@@ -973,6 +974,7 @@ exit /b 0
 	t.Cleanup(func() {
 		slingNoConvoy = prevNoConvoy
 		slingNoBoot = prevNoBoot
+		slingCreate = prevCreate
 		slingHookRawBead = prevHookRaw
 		spawnPolecatForSling = prevSpawn
 		resolveTargetAgentFn = prevResolveTargetAgent
@@ -981,6 +983,7 @@ exit /b 0
 	})
 	slingNoConvoy = true
 	slingNoBoot = true
+	slingCreate = true
 	slingHookRawBead = true
 
 	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
@@ -1546,6 +1549,7 @@ func TestResolveTargetRevivesNamedPolecatWithExactName(t *testing.T) {
 
 	resolved, err := resolveTarget("gastown/polecats/toast", ResolveTargetOptions{
 		TownRoot: t.TempDir(),
+		Create:   true,
 		HookBead: "gt-work",
 		Agent:    "codex",
 		NoBoot:   true,
@@ -1559,6 +1563,97 @@ func TestResolveTargetRevivesNamedPolecatWithExactName(t *testing.T) {
 
 	if got := gotOpts.PolecatName; got != "toast" {
 		t.Fatalf("resolver PolecatName = %q, want toast", got)
+	}
+}
+
+func TestResolveTargetNamedPolecatRequiresCreateForMissingCanonicalPath(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	prevResolve := resolveTargetAgentFn
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		resolveTargetAgentFn = prevResolve
+		spawnPolecatForSling = prevSpawn
+	})
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "", "", "", errors.New("getting pane: session not found")
+	}
+
+	var calls []SlingSpawnOptions
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		calls = append(calls, opts)
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: opts.PolecatName,
+			ClonePath:   filepath.Join(townRoot, "gastown", "polecats", opts.PolecatName),
+		}, nil
+	}
+
+	_, err := resolveTarget("gastown/polecats/toast", ResolveTargetOptions{
+		TownRoot: townRoot,
+		NoBoot:   true,
+	})
+	if err == nil {
+		t.Fatal("missing named polecat must require Create=true")
+	}
+	if len(calls) != 0 {
+		t.Fatalf("resolver dispatched missing named polecat without Create: %+v", calls)
+	}
+
+	resolved, err := resolveTarget("gastown/polecats/toast", ResolveTargetOptions{
+		TownRoot: townRoot,
+		Create:   true,
+		NoBoot:   true,
+	})
+	if err != nil {
+		t.Fatalf("resolveTarget with Create: %v", err)
+	}
+	if resolved.Agent != "gastown/polecats/toast" {
+		t.Fatalf("resolved agent = %q, want gastown/polecats/toast", resolved.Agent)
+	}
+	if len(calls) != 1 || !calls[0].Create || calls[0].PolecatName != "toast" {
+		t.Fatalf("Create dispatch = %+v, want one named create", calls)
+	}
+}
+
+func TestResolveTargetMixedCaseNamedPolecatUsesCanonicalIdentity(t *testing.T) {
+	prevResolve := resolveTargetAgentFn
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		resolveTargetAgentFn = prevResolve
+		spawnPolecatForSling = prevSpawn
+	})
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "", "", "", errors.New("getting pane: session not found")
+	}
+	var gotRig string
+	var gotOpts SlingSpawnOptions
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		gotRig = rigName
+		gotOpts = opts
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: opts.PolecatName,
+			ClonePath:   filepath.Join(t.TempDir(), "gastown", "polecats", opts.PolecatName),
+		}, nil
+	}
+
+	resolved, err := resolveTarget("GASTOWN/POLECATS/TOAST", ResolveTargetOptions{
+		TownRoot: t.TempDir(),
+		Create:   true,
+		NoBoot:   true,
+	})
+	if err != nil {
+		t.Fatalf("resolveTarget mixed case: %v", err)
+	}
+	if gotRig != "gastown" || gotOpts.PolecatName != "toast" {
+		t.Fatalf("spawn target = rig %q opts %+v, want gastown/toast", gotRig, gotOpts)
+	}
+	if resolved.Agent != "gastown/polecats/toast" {
+		t.Fatalf("resolved agent = %q, want gastown/polecats/toast", resolved.Agent)
 	}
 }
 
@@ -5351,5 +5446,82 @@ func TestSpawnNamedPolecatRejectsNonReusablePreservedWork(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func installHasSessionErrorTmux(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("hostile tmux wrapper uses a POSIX shell")
+	}
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux not installed")
+	}
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "has-session-probed")
+	script := `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "has-session" ] && [ ! -e "$GT_HOSTILE_TMUX_MARKER" ]; then
+    : > "$GT_HOSTILE_TMUX_MARKER"
+    echo "injected has-session failure" >&2
+    exit 42
+  fi
+done
+exec "$GT_REAL_TMUX" "$@"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0755); err != nil {
+		t.Fatalf("write hostile tmux wrapper: %v", err)
+	}
+	t.Setenv("GT_HOSTILE_TMUX_MARKER", marker)
+	t.Setenv("GT_REAL_TMUX", realTmux)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestSpawnNamedPolecatFailsClosedOnHasSessionError(t *testing.T) {
+	fixture := setupNamedPolecatCurrentMainFixture(t, "idle", "clean")
+	worktreeGit := git.NewGit(fixture.clonePath)
+	beforeBranch, err := worktreeGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("read branch before hostile probe: %v", err)
+	}
+	beforeHead, err := worktreeGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("read HEAD before hostile probe: %v", err)
+	}
+	beforeStatus := namedPolecatCurrentMainGitOutput(t, fixture.clonePath, "status", "--porcelain")
+	beforeDesc, err := os.ReadFile(fixture.descPath)
+	if err != nil {
+		t.Fatalf("read identity before hostile probe: %v", err)
+	}
+	beforeWorktrees := namedPolecatCurrentMainGitOutput(t, fixture.clonePath, "worktree", "list", "--porcelain")
+
+	installHasSessionErrorTmux(t)
+	_, err = spawnNamedPolecatForSling("gastown", fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
+		PolecatName: "toast",
+		HookBead:    "gt-next",
+	})
+	if err == nil {
+		t.Errorf("non-not-found HasSession error must fail closed")
+	} else if !strings.Contains(err.Error(), "session") {
+		t.Fatalf("HasSession error = %v, want session probe context", err)
+	}
+
+	afterBranch, err := worktreeGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("read branch after hostile probe: %v", err)
+	}
+	afterHead, err := worktreeGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("read HEAD after hostile probe: %v", err)
+	}
+	afterStatus := namedPolecatCurrentMainGitOutput(t, fixture.clonePath, "status", "--porcelain")
+	afterDesc, err := os.ReadFile(fixture.descPath)
+	if err != nil {
+		t.Fatalf("read identity after hostile probe: %v", err)
+	}
+	afterWorktrees := namedPolecatCurrentMainGitOutput(t, fixture.clonePath, "worktree", "list", "--porcelain")
+	if afterBranch != beforeBranch || afterHead != beforeHead || afterStatus != beforeStatus || string(afterDesc) != string(beforeDesc) || afterWorktrees != beforeWorktrees {
+		t.Fatalf("hostile HasSession probe mutated named polecat:\nbranch %q -> %q\nHEAD %s -> %s\nstatus %q -> %q\ndesc %q -> %q\nworktrees changed=%v", beforeBranch, afterBranch, beforeHead, afterHead, beforeStatus, afterStatus, string(beforeDesc), string(afterDesc), beforeWorktrees != afterWorktrees)
 	}
 }
