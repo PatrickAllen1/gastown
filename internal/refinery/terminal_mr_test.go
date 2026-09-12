@@ -2,6 +2,7 @@ package refinery
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +12,84 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 )
+
+func TestTerminalReviewSelectionAcceptsFullGtVd345MetadataAsInert(t *testing.T) {
+	receipt := beads.ReviewReceiptV1{
+		ReceiptVersion:   1,
+		SourceIssue:      "gt-source-terminal-vd345",
+		ReviewChildIssue: "gt-review-terminal-vd345",
+		CandidateCommit:  strings.Repeat("a", 40),
+		CandidateTree:    strings.Repeat("b", 40),
+		TargetRef:        "refs/heads/main",
+		Verdict:          beads.ReviewReceiptVerdictChangesRequired,
+		ReviewModel:      "codex-sol-medium",
+		ReviewProfile:    "medium",
+	}
+	comment := beads.Comment{
+		ID:        "comment-terminal-vd345",
+		IssueID:   receipt.ReviewChildIssue,
+		Author:    "sweetpea/",
+		Text:      beads.FormatReviewReceiptV1(receipt),
+		CreatedAt: "2026-09-12T10:00:00Z",
+	}
+	child := &beads.Issue{
+		ID:     receipt.ReviewChildIssue,
+		Parent: receipt.SourceIssue,
+		Status: "closed",
+		Metadata: json.RawMessage(`{
+"actual_handle":"/root/gt_vd3_4_r4_sol_review_sweetpea",
+"actual_handle_status":"TERMINAL_COMPLETED",
+"actual_model":"codex-sol-medium",
+"candidate_commit":"c3324c9dcfe189ed4a3d69987afa4c13ff76a3f9",
+"candidate_diff_sha256":"9f7418629c7c811eeb234e8f493ad8bdfbe6ee5cb3acd2f196433d2bae068c23",
+"candidate_parent":"ac9bff2052a47b38598d4e25a99bf339b4997441",
+"candidate_paths_sha256":"64d0247caa6095b11dae9886be80a2053b3ae87fd80a2a27dfa77d22ec2a9684",
+"candidate_tree":"1a80fc2555cd9268d2b844e52b6406f5af44cb83",
+"current_private_main":"ac9bff2052a47b38598d4e25a99bf339b4997441",
+"current_private_main_tree":"ef8956ba6387b551a7b5c6fa41ee408626bd7ecd",
+"gate_status":"ALL_REQUIRED_GATES_PASS_ONE_BLOCKER",
+"landing_authorized":false,
+"mutation_authorized":false,
+"phase":"TERMINAL_CHANGES_REQUIRED",
+"review_handle":"/root/gt_vd3_4_r4_sol_review_sweetpea",
+"review_model":"codex-sol-medium",
+"review_status":"CHANGES_REQUIRED",
+"reviewer_active":false,
+"terminal_verdict":"CHANGES_REQUIRED"
+}`),
+		Comments: []beads.Comment{comment},
+	}
+	ctx := beads.ReviewReceiptValidationContext{
+		SourceIssue:      &beads.Issue{ID: receipt.SourceIssue, Status: "open"},
+		ReviewChildIssue: child,
+		CandidateCommit:  receipt.CandidateCommit,
+		CandidateTree:    receipt.CandidateTree,
+		TargetRef:        receipt.TargetRef,
+		FrozenAt:         mustTerminalReviewTime(t, "2026-09-12T09:00:00Z"),
+		Author:           "author/",
+	}
+	current, err := beads.SelectCurrentReviewReceiptV1FromIssue(ctx)
+	if err != nil {
+		t.Fatalf("full gt-vd3.4.5 metadata rejected: %v", err)
+	}
+	if current.IsFinalPass() || current.Verdict != receipt.Verdict || current.CandidateCommit != receipt.CandidateCommit {
+		t.Fatalf("selected receipt = %+v, want canonical typed Comment", current)
+	}
+
+	child.Metadata = json.RawMessage(`{"review_model":null}`)
+	if _, err := beads.SelectCurrentReviewReceiptV1FromIssue(ctx); err == nil {
+		t.Fatal("terminal review selection accepted malformed gt-vd3.4.5 metadata")
+	}
+}
+
+func mustTerminalReviewTime(t *testing.T, raw string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t.Fatalf("parse terminal review time: %v", err)
+	}
+	return parsed
+}
 
 func TestValidateTerminalMRCloseSnapshotRejectsDrift(t *testing.T) {
 	expected := &MergeRequest{

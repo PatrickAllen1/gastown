@@ -826,6 +826,82 @@ func mustReviewReceiptTime(t *testing.T, raw string) time.Time {
 	return parsed
 }
 
+func reviewReceiptV1GtVd345OperationalMetadata() json.RawMessage {
+	return json.RawMessage(`{
+"actual_handle":"/root/gt_vd3_4_r4_sol_review_sweetpea",
+"actual_handle_status":"TERMINAL_COMPLETED",
+"actual_model":"codex-sol-medium",
+"candidate_commit":"c3324c9dcfe189ed4a3d69987afa4c13ff76a3f9",
+"candidate_diff_sha256":"9f7418629c7c811eeb234e8f493ad8bdfbe6ee5cb3acd2f196433d2bae068c23",
+"candidate_parent":"ac9bff2052a47b38598d4e25a99bf339b4997441",
+"candidate_paths_sha256":"64d0247caa6095b11dae9886be80a2053b3ae87fd80a2a27dfa77d22ec2a9684",
+"candidate_tree":"1a80fc2555cd9268d2b844e52b6406f5af44cb83",
+"current_private_main":"ac9bff2052a47b38598d4e25a99bf339b4997441",
+"current_private_main_tree":"ef8956ba6387b551a7b5c6fa41ee408626bd7ecd",
+"gate_status":"ALL_REQUIRED_GATES_PASS_ONE_BLOCKER",
+"landing_authorized":false,
+"mutation_authorized":false,
+"phase":"TERMINAL_CHANGES_REQUIRED",
+"review_handle":"/root/gt_vd3_4_r4_sol_review_sweetpea",
+"review_model":"codex-sol-medium",
+"review_status":"CHANGES_REQUIRED",
+"reviewer_active":false,
+"terminal_verdict":"CHANGES_REQUIRED"
+}`)
+}
+
+func TestReviewReceiptV1ValidatorAcceptsFullGtVd345OperationalMetadata(t *testing.T) {
+	receipt, comment, ctx := reviewReceiptV1Fixture(t)
+	ctx.ReviewChildIssue.Metadata = reviewReceiptV1GtVd345OperationalMetadata()
+	parsed, err := ParseReviewReceiptV1(comment)
+	if err != nil {
+		t.Fatalf("fixture parse: %v", err)
+	}
+	if err := ValidateReviewReceiptV1(parsed, comment, ctx); err != nil {
+		t.Fatalf("ValidateReviewReceiptV1() rejected full gt-vd3.4.5 metadata: %v", err)
+	}
+	if parsed.CandidateCommit != receipt.CandidateCommit || parsed.Verdict != receipt.Verdict {
+		t.Fatalf("typed Comment authority changed: %+v", parsed)
+	}
+}
+
+func TestReviewReceiptV1ValidatorRejectsUnknownOrMalformedGtVd345Metadata(t *testing.T) {
+	receipt, comment, ctx := reviewReceiptV1Fixture(t)
+	cases := map[string]json.RawMessage{
+		"unknown key":       json.RawMessage(`{"operator":"forged"}`),
+		"malformed object":  json.RawMessage(`{"review_model":`),
+		"top-level array":   json.RawMessage(`[]`),
+		"duplicate key":     json.RawMessage(`{"review_model":"one","review_model":"two"}`),
+		"null string":       json.RawMessage(`{"review_model":null}`),
+		"wrong string type": json.RawMessage(`{"review_model":true}`),
+		"nested value":      json.RawMessage(`{"review_model":{"value":"nested"}}`),
+		"control string":    json.RawMessage(`{"review_handle":"bad\u0000value"}`),
+	}
+	cases["oversized string"] = json.RawMessage(`{"review_handle":"` + strings.Repeat("x", 1025) + `"}`)
+	for name, metadata := range cases {
+		t.Run(name, func(t *testing.T) {
+			validation := ctx
+			child := *ctx.ReviewChildIssue
+			child.Metadata = metadata
+			validation.ReviewChildIssue = &child
+			if err := ValidateReviewReceiptV1(receipt, comment, validation); err == nil {
+				t.Fatalf("ValidateReviewReceiptV1() accepted %s metadata", name)
+			}
+		})
+	}
+}
+
+func TestReviewReceiptV1GtVd345MetadataCannotReplaceCanonicalComment(t *testing.T) {
+	receipt, comment, ctx := reviewReceiptV1Fixture(t)
+	ctx.ReviewChildIssue.Metadata = reviewReceiptV1GtVd345OperationalMetadata()
+	hostile := receipt
+	hostile.CandidateCommit = strings.Repeat("c", 40)
+	comment.Text = FormatReviewReceiptV1(hostile)
+	if _, err := ValidateReviewReceiptCommentV1(comment, ctx); err == nil {
+		t.Fatal("metadata claims compensated for a hostile canonical Comment")
+	}
+}
+
 func TestReviewReceiptV1RoundTripDerivesCommentAuthority(t *testing.T) {
 	receipt, comment, _ := reviewReceiptV1Fixture(t)
 	got, err := ParseReviewReceiptV1(comment)

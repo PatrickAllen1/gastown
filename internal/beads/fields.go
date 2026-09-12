@@ -2,8 +2,10 @@
 package beads
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -1820,8 +1822,8 @@ func validateReviewReceiptAgainstContext(receipt ReviewReceiptV1, comment Commen
 	if !IssueStatus(child.Status).IsTerminal() {
 		return fmt.Errorf("review receipt child is not terminal")
 	}
-	if reviewReceiptHasArbitraryMetadata(child.Metadata) {
-		return fmt.Errorf("review receipt child has arbitrary metadata")
+	if err := validateReviewReceiptMetadata(child.Metadata); err != nil {
+		return fmt.Errorf("review receipt child metadata: %w", err)
 	}
 	if child.Comments != nil {
 		for _, stored := range child.Comments {
@@ -1943,16 +1945,159 @@ func reviewReceiptReachableInAllSets(candidate string, context ReviewReceiptVali
 	return true
 }
 
-func reviewReceiptHasArbitraryMetadata(metadata json.RawMessage) bool {
-	trimmed := strings.TrimSpace(string(metadata))
-	if trimmed == "" || trimmed == "null" {
-		return false
+type reviewReceiptMetadataFieldType uint8
+
+const (
+	reviewReceiptMetadataString reviewReceiptMetadataFieldType = iota + 1
+	reviewReceiptMetadataInteger
+	reviewReceiptMetadataBoolean
+)
+
+const reviewReceiptMetadataMaxStringBytes = 1024
+
+// reviewReceiptMetadataAllowlist describes the inert orchestration metadata
+// currently attached to authoritative review children. These fields are
+// deliberately not copied into ReviewReceiptV1 and never participate in
+// source, reviewer, verdict, freshness, or candidate binding.
+var reviewReceiptMetadataAllowlist = map[string]reviewReceiptMetadataFieldType{
+	"actual_handle":                     reviewReceiptMetadataString,
+	"actual_handle_status":              reviewReceiptMetadataString,
+	"actual_model":                      reviewReceiptMetadataString,
+	"boundary_reproductions":            reviewReceiptMetadataString,
+	"candidate_commit":                  reviewReceiptMetadataString,
+	"candidate_diff_sha256":             reviewReceiptMetadataString,
+	"candidate_parent":                  reviewReceiptMetadataString,
+	"candidate_parent_tree":             reviewReceiptMetadataString,
+	"candidate_paths_sha256":            reviewReceiptMetadataString,
+	"candidate_tree":                    reviewReceiptMetadataString,
+	"cumulative_base":                   reviewReceiptMetadataString,
+	"cumulative_full_index_diff_sha256": reviewReceiptMetadataString,
+	"current_main_overlap":              reviewReceiptMetadataString,
+	"current_private_main":              reviewReceiptMetadataString,
+	"current_private_main_tree":         reviewReceiptMetadataString,
+	"dispatch_authorized":               reviewReceiptMetadataBoolean,
+	"exact_path_count":                  reviewReceiptMetadataInteger,
+	"exact_path_lease":                  reviewReceiptMetadataString,
+	"gate_status":                       reviewReceiptMetadataString,
+	"host_process_status":               reviewReceiptMetadataString,
+	"landed":                            reviewReceiptMetadataBoolean,
+	"landing_authorized":                reviewReceiptMetadataBoolean,
+	"mutation_authorized":               reviewReceiptMetadataBoolean,
+	"parent_full_index_diff_sha256":     reviewReceiptMetadataString,
+	"phase":                             reviewReceiptMetadataString,
+	"provider_action_authorized":        reviewReceiptMetadataBoolean,
+	"reconciliation_receipt":            reviewReceiptMetadataString,
+	"requested_model":                   reviewReceiptMetadataString,
+	"review_handle":                     reviewReceiptMetadataString,
+	"review_model":                      reviewReceiptMetadataString,
+	"review_status":                     reviewReceiptMetadataString,
+	"reviewer_active":                   reviewReceiptMetadataBoolean,
+	"reviewer_identity":                 reviewReceiptMetadataString,
+	"terminal_verdict":                  reviewReceiptMetadataString,
+	"verified_candidate_commit":         reviewReceiptMetadataString,
+	"verified_candidate_tree":           reviewReceiptMetadataString,
+}
+
+// validateReviewReceiptMetadata accepts only the inert metadata shape emitted
+// on the real review child. Empty metadata and JSON null are valid because
+// metadata is optional. Every nonempty object is parsed token-by-token so
+// duplicate keys cannot be hidden by map decoding, and no value is consulted
+// as receipt authority.
+func validateReviewReceiptMetadata(metadata json.RawMessage) error {
+	trimmed := bytes.TrimSpace(metadata)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(metadata, &object); err != nil {
-		return true
+	if !utf8.Valid(trimmed) {
+		return fmt.Errorf("metadata is not valid UTF-8")
 	}
-	return len(object) != 0
+
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("metadata JSON is malformed: %w", err)
+	}
+	objectStart, ok := token.(json.Delim)
+	if !ok || objectStart != '{' {
+		return fmt.Errorf("metadata must be a JSON object")
+	}
+
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("metadata object is malformed: %w", err)
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("metadata key is not a string")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("metadata key %q is duplicated", key)
+		}
+		seen[key] = struct{}{}
+		fieldType, allowed := reviewReceiptMetadataAllowlist[key]
+		if !allowed {
+			return fmt.Errorf("metadata key %q is unknown", key)
+		}
+
+		var rawValue json.RawMessage
+		if err := decoder.Decode(&rawValue); err != nil {
+			return fmt.Errorf("metadata value for %q is malformed: %w", key, err)
+		}
+		if err := validateReviewReceiptMetadataValue(key, fieldType, rawValue); err != nil {
+			return err
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("metadata object is missing closing delimiter: %w", err)
+	}
+	if objectEnd, ok := closing.(json.Delim); !ok || objectEnd != '}' {
+		return fmt.Errorf("metadata object has invalid closing delimiter")
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("metadata has trailing JSON data")
+		}
+		return fmt.Errorf("metadata has trailing malformed data: %w", err)
+	}
+	return nil
+}
+
+func validateReviewReceiptMetadataValue(key string, fieldType reviewReceiptMetadataFieldType, rawValue json.RawMessage) error {
+	if bytes.Equal(bytes.TrimSpace(rawValue), []byte("null")) {
+		return fmt.Errorf("metadata value for %q must not be null", key)
+	}
+	switch fieldType {
+	case reviewReceiptMetadataString:
+		var value string
+		if err := json.Unmarshal(rawValue, &value); err != nil {
+			return fmt.Errorf("metadata value for %q must be a string", key)
+		}
+		if value == "" || len(value) > reviewReceiptMetadataMaxStringBytes || !utf8.ValidString(value) {
+			return fmt.Errorf("metadata value for %q is empty, oversized, or invalid", key)
+		}
+		for _, char := range value {
+			if unicode.IsControl(char) {
+				return fmt.Errorf("metadata value for %q contains control data", key)
+			}
+		}
+	case reviewReceiptMetadataInteger:
+		var value int64
+		if err := json.Unmarshal(rawValue, &value); err != nil || value < 0 {
+			return fmt.Errorf("metadata value for %q must be a non-negative integer", key)
+		}
+	case reviewReceiptMetadataBoolean:
+		var value bool
+		if err := json.Unmarshal(rawValue, &value); err != nil {
+			return fmt.Errorf("metadata value for %q must be a boolean", key)
+		}
+	default:
+		return fmt.Errorf("metadata key %q has unsupported type", key)
+	}
+	return nil
 }
 
 // SelectCurrentReviewReceiptV1 parses and validates all comments in a
