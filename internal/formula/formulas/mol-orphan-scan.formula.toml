@@ -22,11 +22,41 @@ This is infrastructure work. You:
 5. Report findings
 6. Return to kennel
 
+## Crew Logical-Lane Ownership Guard
+
+`gt session list` is only a physical-session inventory. A long-lived Crew
+session may own nested writer/reviewer handles, and those logical lanes do not
+have separate Gas Town session entries. A missing row in `gt session list` is
+therefore never evidence by itself that a Crew lane is abandoned.
+
+For every issue or molecule whose owner is Crew, or whose metadata names a
+nested Crew lane:
+
+1. Read the candidate Bead and the authoritative owner Bead. Locate the
+   writer/reviewer handle record and its state, including the hook bead,
+   attached molecule/formula, assignee, and active/finished state.
+2. Authenticate ownership and liveness with
+   `gt hook show <rig>/crew/<name> --json` and
+   `gt session status <rig>/crew/<name> --json`. The owner's
+   `running=true` result is the liveness signal. Do not require a separate
+   session-list entry for the nested handle.
+3. Apply this decision table:
+   - `LIVE_NESTED_HANDLE`: the owner session is running and the authoritative
+     writer/reviewer handle is present and active. Preserve it; do not report
+     it as an orphan or recover it.
+   - `MISSING_HANDLE`: the authoritative handle record is absent. Keep the
+     missing handle visible in the report, regardless of owner liveness, and
+     only propose recovery after the owner's death is independently confirmed.
+   - `UNCERTAIN`: owner session, Bead ownership, or handle state is missing,
+     contradictory, or unavailable. Report/escalate only and preserve worker
+     custody. Do not reset, do not reassign, do not close, do not burn, do not
+     kill, and do not restart work from an uncertain state.
+
 ## Variables
 
 | Variable | Source | Description |
 |----------|--------|-------------|
-| scope | hook_bead | Scan scope: 'town' or specific rig name |
+| scope | hook_bead (default: 'town') | Scan scope: 'town' or specific rig name |
 
 ## Why Dogs?
 
@@ -54,6 +84,7 @@ gt hook               # Shows scope in hook_bead
 **2. Resolve scope:**
 - 'town': Scan all rigs
 - '<rig>': Scan specific rig only
+- omitted: use the formula default 'town'
 
 ```bash
 # If town-wide
@@ -99,9 +130,18 @@ If the assignee is NOT a polecat (e.g., witness, refinery), use:
 gt session status <rig>/<role> --json | jq -r '.running' | grep -q true && echo ALIVE || echo DEAD
 ```
 
+If the assignee is Crew or the Bead names a nested Crew writer/reviewer lane,
+apply the **Crew Logical-Lane Ownership Guard** above before classifying it.
+The owner Crew session is authoritative; do not infer a dead nested lane from
+`gt session list`.
+
 **4. Identify orphans:**
 - Issue in_progress + assignee session dead = orphan
 - Issue in_progress + no assignee = orphan
+- A live nested Crew handle is preserved, even without its own session entry.
+- A missing handle is reported as `MISSING_HANDLE` for visibility.
+- An unverified or contradictory state is reported as `UNCERTAIN`, never as a
+  recoverable orphan.
 
 Record each orphan with:
 - Issue ID
@@ -138,9 +178,17 @@ Parse the owner/agent field to extract rig and name:
 gt session status <rig>/<name> --json | jq -r '.running' | grep -q true && echo ALIVE || echo DEAD
 ```
 
+For a Crew owner or nested Crew writer/reviewer lane, apply the **Crew
+Logical-Lane Ownership Guard**. Verify the owner Crew session and the
+authoritative Bead handle state before recovery; a nested handle need not have
+its own `gt session list` entry.
+
 **4. Identify orphans:**
 - Molecule in_progress + owner session dead = orphan
 - Molecule hooked + owner session dead = orphan
+- Live nested Crew handles are not orphans.
+- Missing handles remain visible as `MISSING_HANDLE`.
+- Unknown or contradictory evidence is `UNCERTAIN` and remains untouched.
 
 Record each orphan for triage.
 
@@ -202,6 +250,11 @@ git log --oneline <branch>
 - ESCALATE: Data loss or complex situation
 - BURN: Safe to delete (empty wisps, etc.)
 
+Crew lane outcomes are separate from recovery actions:
+- `LIVE_NESTED_HANDLE`: preserve the worker's custody and active handle.
+- `MISSING_HANDLE`: keep the missing handle in the report; do not hide it.
+- `UNCERTAIN`: escalate/report only. No worker-custody mutation is allowed.
+
 **Exit criteria:** All orphans categorized with planned action."""
 
 [[steps]]
@@ -246,6 +299,12 @@ Recommended action: ..."
 # For empty wisps, etc.
 rm .beads-wisp/<wisp-file>
 ```
+
+**6. UNCERTAIN or Crew lane states:**
+Keep worker custody unchanged and record the evidence in the report. Do not
+reset, do not reassign, do not close, do not burn, do not kill, and do not
+restart work when owner liveness, authoritative Bead ownership, or
+writer/reviewer handle state is uncertain.
 
 **Exit criteria:** All orphans handled."""
 
@@ -322,7 +381,7 @@ Dog returns to available state in the pool.
 [vars]
 [vars.scope]
 description = "Scan scope: 'town' or specific rig name"
-required = true
+default = "town"
 
 [vars.action]
 description = "Recovery action taken for an orphan (computed during execution)"
