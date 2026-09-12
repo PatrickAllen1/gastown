@@ -5123,6 +5123,24 @@ type namedPolecatCurrentMainFixture struct {
 	descPath  string
 }
 
+func namedPolecatCurrentMainNamespace(t *testing.T) string {
+	t.Helper()
+	var sanitized strings.Builder
+	for _, r := range strings.ToLower(t.Name()) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			sanitized.WriteRune(r)
+		default:
+			sanitized.WriteByte('-')
+		}
+	}
+	name := strings.Trim(sanitized.String(), "-")
+	if len(name) > 40 {
+		name = name[:40]
+	}
+	return fmt.Sprintf("gt-h36-%d-%s", os.Getpid(), name)
+}
+
 func setupNamedPolecatCurrentMainFixture(t *testing.T, mode, cleanupStatus string) namedPolecatCurrentMainFixture {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -5130,7 +5148,8 @@ func setupNamedPolecatCurrentMainFixture(t *testing.T, mode, cleanupStatus strin
 	}
 
 	townRoot := t.TempDir()
-	rigPath := filepath.Join(townRoot, "gastown")
+	namespace := namedPolecatCurrentMainNamespace(t)
+	rigPath := filepath.Join(townRoot, namespace)
 	mayorRig := filepath.Join(rigPath, "mayor", "rig")
 	remote := filepath.Join(townRoot, "remote.git")
 	for _, dir := range []string{
@@ -5149,7 +5168,7 @@ func setupNamedPolecatCurrentMainFixture(t *testing.T, mode, cleanupStatus strin
 	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
 		t.Fatalf("write rig beads redirect: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(fmt.Sprintf(`{"prefix":"gt-","path":"%s/mayor/rig"}`+"\n", namespace)), 0644); err != nil {
 		t.Fatalf("write beads routes: %v", err)
 	}
 
@@ -5174,7 +5193,7 @@ func setupNamedPolecatCurrentMainFixture(t *testing.T, mode, cleanupStatus strin
 	runNamedPolecatCurrentMainGit(t, mayorRig, "switch", "main")
 
 	baseSHA := strings.TrimSpace(namedPolecatCurrentMainGitOutput(t, mayorRig, "rev-parse", "origin/task-base"))
-	clonePath := filepath.Join(rigPath, "polecats", "toast", "gastown")
+	clonePath := filepath.Join(rigPath, "polecats", "toast", namespace)
 	if err := os.MkdirAll(filepath.Dir(clonePath), 0755); err != nil {
 		t.Fatalf("mkdir polecat parent: %v", err)
 	}
@@ -5189,7 +5208,7 @@ func setupNamedPolecatCurrentMainFixture(t *testing.T, mode, cleanupStatus strin
 		"agent",
 		"",
 		"role_type: polecat",
-		"rig: gastown",
+		"rig: " + namespace,
 		"agent_state: idle",
 		"agent_profile: codex",
 		"hook_bead: null",
@@ -5205,6 +5224,8 @@ func setupNamedPolecatCurrentMainFixture(t *testing.T, mode, cleanupStatus strin
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir bd bin: %v", err)
 	}
+	preservedAssignee := namespace + "/polecats/toast"
+	defaultAgentID := "gt-" + namespace + "-polecat-toast"
 	bdScript := fmt.Sprintf(`#!/bin/sh
 set -eu
 cmd=""
@@ -5228,6 +5249,8 @@ agent_json() {
   description=$(json_escape %q)
   printf '[{"id":"%%s","title":"agent","issue_type":"agent","status":"open","description":"%%s"}]\n' "$1" "$description"
 }
+preserved_assignee="%s"
+default_agent_id="%s"
 case "$cmd" in
   version)
     echo "bd named current-main fixture"
@@ -5237,7 +5260,7 @@ case "$cmd" in
       *" gt:agent "*) agent_json "%%s" ;;
       *)
         if [ "${BD_NAMED_MODE:-idle}" = "active" ]; then
-          printf '%%s\n' '[{"id":"gt-preserved-work","title":"preserved work","issue_type":"task","status":"hooked","assignee":"gastown/polecats/toast","description":""}]'
+          printf '%%s\n' '[{"id":"gt-preserved-work","title":"preserved work","issue_type":"task","status":"hooked","assignee":"'"$preserved_assignee"'","description":""}]'
         else
           printf '%%s\n' '[]'
         fi
@@ -5246,9 +5269,9 @@ case "$cmd" in
     ;;
   show)
     if [ "${id:-}" = "gt-preserved-work" ]; then
-      printf '%%s\n' '[{"id":"gt-preserved-work","title":"preserved work","issue_type":"task","status":"hooked","assignee":"gastown/polecats/toast","description":""}]'
+      printf '%%s\n' '[{"id":"gt-preserved-work","title":"preserved work","issue_type":"task","status":"hooked","assignee":"'"$preserved_assignee"'","description":""}]'
     else
-      agent_json "${id:-gt-gastown-polecat-toast}"
+      agent_json "${id:-$default_agent_id}"
     fi
     ;;
   create)
@@ -5268,7 +5291,7 @@ case "$cmd" in
     ;;
 esac
 exit 0
-`, descPath, descPath, descPath)
+`, descPath, preservedAssignee, defaultAgentID, descPath, descPath)
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
 		t.Fatalf("write bd fixture: %v", err)
 	}
@@ -5277,8 +5300,9 @@ exit 0
 	beads.ResetBdAllowStaleCacheForTest()
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 
-	r := &rig.Rig{Name: "gastown", Path: rigPath}
-	tm := tmux.NewTmux()
+	r := &rig.Rig{Name: namespace, Path: rigPath}
+	tm := tmux.NewTmuxWithSocket(namespace + "-tmux")
+	t.Cleanup(func() { _ = tm.KillServer() })
 	mgr := polecat.NewManager(r, git.NewGit(rigPath), tm)
 	return namedPolecatCurrentMainFixture{
 		townRoot:  townRoot,
@@ -5323,7 +5347,7 @@ func TestSpawnNamedPolecatReusesIdleIdentityThroughLifecycle(t *testing.T) {
 		t.Fatalf("fixture branch = %q, want %q", oldBranch, fixture.oldBranch)
 	}
 
-	spawned, err := spawnNamedPolecatForSling("gastown", fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
+	spawned, err := spawnNamedPolecatForSling(fixture.rig.Name, fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
 		PolecatName: "toast",
 		HookBead:    "gt-next",
 		Agent:       "gemini",
@@ -5371,7 +5395,7 @@ func TestSpawnNamedPolecatReusesIdleIdentityThroughLifecycle(t *testing.T) {
 	}
 	desc := string(descBytes)
 	for _, want := range []string{
-		"rig: gastown",
+		"rig: " + fixture.rig.Name,
 		"agent_state: spawning",
 		"agent_profile: gemini",
 		"hook_bead: gt-next",
@@ -5385,7 +5409,7 @@ func TestSpawnNamedPolecatReusesIdleIdentityThroughLifecycle(t *testing.T) {
 func TestSpawnNamedPolecatRetainsDurableProfileWithoutOverride(t *testing.T) {
 	fixture := setupNamedPolecatCurrentMainFixture(t, "idle", "clean")
 
-	if _, err := spawnNamedPolecatForSling("gastown", fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
+	if _, err := spawnNamedPolecatForSling(fixture.rig.Name, fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
 		PolecatName: "toast",
 		HookBead:    "gt-next",
 	}); err != nil {
@@ -5442,7 +5466,7 @@ func TestSpawnNamedPolecatRejectsNonReusablePreservedWork(t *testing.T) {
 				t.Cleanup(func() { _ = fixture.tmux.KillSessionWithProcesses(sessionName) })
 				polecat.TouchSessionHeartbeat(fixture.townRoot, sessionName)
 			}
-			_, err := spawnNamedPolecatForSling("gastown", fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
+			_, err := spawnNamedPolecatForSling(fixture.rig.Name, fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
 				PolecatName: "toast",
 				HookBead:    "gt-next",
 			})
@@ -5507,7 +5531,7 @@ func TestSpawnNamedPolecatFailsClosedOnHasSessionError(t *testing.T) {
 	beforeWorktrees := namedPolecatCurrentMainGitOutput(t, fixture.clonePath, "worktree", "list", "--porcelain")
 
 	installHasSessionErrorTmux(t)
-	_, err = spawnNamedPolecatForSling("gastown", fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
+	_, err = spawnNamedPolecatForSling(fixture.rig.Name, fixture.rig, fixture.manager, fixture.tmux, SlingSpawnOptions{
 		PolecatName: "toast",
 		HookBead:    "gt-next",
 	})
