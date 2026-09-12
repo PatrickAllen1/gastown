@@ -542,6 +542,7 @@ type beadFieldUpdates struct {
 	AttachedFormula  string   // Formula name (e.g., "mol-polecat-work") for inline step display
 	ClearAttachment  bool     // Clear stale workflow attachment fields before applying updates
 	AttachedAt       string   // Assignment timestamp; refreshed when workflow metadata is written
+	AgentProfile     string   // Requested runtime/profile override
 	NoMerge          bool     // Skip merge queue on completion
 	ReviewOnly       bool     // Review-only mode: assignee must not merge/commit/push
 	Mode             *string  // Execution mode: nil means unchanged, "" clears, "ralph" enables Ralph mode
@@ -633,6 +634,9 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
 	}
 	if updates.Dispatcher != "" {
 		fields.DispatchedBy = updates.Dispatcher
+	}
+	if updates.AgentProfile != "" {
+		fields.AgentProfile = updates.AgentProfile
 	}
 	if updates.Args != "" {
 		fields.AttachedArgs = updates.Args

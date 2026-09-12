@@ -186,6 +186,26 @@ func TestGetAgentBead_PrefersDescriptionAgentState(t *testing.T) {
 	}
 }
 
+func TestAgentProfileRoundTrip(t *testing.T) {
+	fields := &AgentFields{
+		RoleType:     "polecat",
+		Rig:          "gastown",
+		AgentState:   "spawning",
+		AgentProfile: "opencode acp",
+		HookBead:     "gt-work",
+	}
+
+	description := FormatAgentDescription("gt-gastown-polecat-toast", fields)
+	if !strings.Contains(description, "agent_profile: opencode acp") {
+		t.Fatalf("FormatAgentDescription missing agent profile:\n%s", description)
+	}
+
+	parsed := ParseAgentFields(description)
+	if parsed.AgentProfile != fields.AgentProfile {
+		t.Fatalf("AgentProfile = %q, want %q", parsed.AgentProfile, fields.AgentProfile)
+	}
+}
+
 func TestGetAgentBead_FallsBackToDescriptionAgentState(t *testing.T) {
 	tmpDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {

@@ -61,6 +61,30 @@ func TestAttachmentFieldsModeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAttachmentFieldsAgentProfileRoundTrip(t *testing.T) {
+	original := &AttachmentFields{
+		AgentProfile: "codex",
+		NoMerge:      true,
+		ReviewOnly:   true,
+	}
+
+	formatted := FormatAttachmentFields(original)
+	if !strings.Contains(formatted, "agent_profile: codex") {
+		t.Fatalf("FormatAttachmentFields missing agent profile:\n%s", formatted)
+	}
+
+	parsed := ParseAttachmentFields(&Issue{Description: formatted})
+	if parsed == nil {
+		t.Fatal("round-trip parse returned nil")
+	}
+	if parsed.AgentProfile != original.AgentProfile {
+		t.Fatalf("AgentProfile = %q, want %q", parsed.AgentProfile, original.AgentProfile)
+	}
+	if !parsed.NoMerge || !parsed.ReviewOnly {
+		t.Fatalf("workflow flags not preserved: %+v", parsed)
+	}
+}
+
 func TestSetAttachmentFieldsPreservesMode(t *testing.T) {
 	issue := &Issue{
 		Description: "mode: ralph\nattached_molecule: gt-wisp-old\nSome other content",

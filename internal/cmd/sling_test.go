@@ -1512,6 +1512,71 @@ func TestResolveTargetCreateSpawnsPolecatShorthandWhenPaneMissing(t *testing.T) 
 	}
 }
 
+func TestResolveTargetRevivesNamedPolecatWithoutLivePane(t *testing.T) {
+	prevResolve := resolveTargetAgentFn
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		resolveTargetAgentFn = prevResolve
+		spawnPolecatForSling = prevSpawn
+	})
+
+	resolveTargetAgentFn = func(target string) (string, string, string, error) {
+		return "", "", "", errors.New("getting pane: session not found")
+	}
+
+	var gotOpts SlingSpawnOptions
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		gotOpts = opts
+		return &SpawnedPolecatInfo{
+			RigName:           rigName,
+			PolecatName:       opts.PolecatName,
+			ClonePath:         "/tmp/gastown/polecats/toast/gastown",
+			HookSetAtomically: true,
+		}, nil
+	}
+
+	got, err := resolveTarget("gastown/polecats/toast", ResolveTargetOptions{
+		TownRoot: t.TempDir(),
+		HookBead: "gt-work",
+		Agent:    "codex",
+		NoBoot:   true,
+	})
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if gotOpts.PolecatName != "toast" {
+		t.Fatalf("PolecatName = %q, want toast", gotOpts.PolecatName)
+	}
+	if got.Agent != "gastown/polecats/toast" {
+		t.Fatalf("Agent = %q, want gastown/polecats/toast", got.Agent)
+	}
+	if got.NewPolecatInfo == nil {
+		t.Fatal("expected named polecat revival to defer session start")
+	}
+}
+
+func TestExplicitNamedPolecatTarget(t *testing.T) {
+	tests := []struct {
+		target string
+		name   string
+		ok     bool
+	}{
+		{target: "gastown/polecats/toast", name: "toast", ok: true},
+		{target: "gastown/polecats/", ok: false},
+		{target: "gastown/crew/toast", ok: false},
+		{target: "gastown/polecats/toast/extra", ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.target, func(t *testing.T) {
+			name, ok := explicitNamedPolecatTarget(tt.target)
+			if name != tt.name || ok != tt.ok {
+				t.Fatalf("explicitNamedPolecatTarget(%q) = (%q, %v), want (%q, %v)",
+					tt.target, name, ok, tt.name, tt.ok)
+			}
+		})
+	}
+}
+
 func TestResolveTargetCreateDoesNotSpawnCrewShorthandWhenPaneMissing(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
@@ -1971,6 +2036,63 @@ func TestExecuteSlingRawReviewOnlySuccessKeepsMetadata(t *testing.T) {
 		t.Fatalf("executeSling result not successful: %+v", result)
 	}
 	assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+}
+
+func TestExecuteSlingSessionStartupFailurePreservesHookedReviewMetadata(t *testing.T) {
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+
+	prevSpawn := spawnPolecatForSling
+	prevHook := hookBeadWithRetryWithTownRootFn
+	prevStart := startSpawnedPolecatSessionFn
+	prevRollback := rollbackSlingArtifactsFn
+	t.Cleanup(func() {
+		spawnPolecatForSling = prevSpawn
+		hookBeadWithRetryWithTownRootFn = prevHook
+		startSpawnedPolecatSessionFn = prevStart
+		rollbackSlingArtifactsFn = prevRollback
+	})
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: "obsidian",
+			ClonePath:   filepath.Join(townRoot, "gastown", "polecats", "obsidian"),
+		}, nil
+	}
+	hookBeadWithRetryWithTownRootFn = func(beadID, targetAgent, hookDir, townRoot string) error {
+		assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+		return nil
+	}
+	startSpawnedPolecatSessionFn = func(*SpawnedPolecatInfo) (string, error) {
+		return "", errors.New("startup blocked by trust prompt")
+	}
+	rollbackCalled := false
+	rollbackSlingArtifactsFn = func(*SpawnedPolecatInfo, string, string, string) {
+		rollbackCalled = true
+	}
+
+	_, err := executeSling(SlingParams{
+		BeadID:      "gt-rawrollback",
+		RigName:     "gastown",
+		TownRoot:    townRoot,
+		BeadsDir:    filepath.Join(rigPath, ".beads"),
+		Agent:       "codex-luna-max",
+		HookRawBead: true,
+		NoMerge:     true,
+		ReviewOnly:  true,
+		NoConvoy:    true,
+		NoBoot:      true,
+	})
+	if err == nil {
+		t.Fatal("expected startup failure")
+	}
+	if rollbackCalled {
+		t.Fatal("startup failure must preserve the polecat instead of rolling it back")
+	}
+
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: readMutableBDDescription(t, descPath)})
+	if fields == nil || !fields.NoMerge || !fields.ReviewOnly || fields.AgentProfile != "codex-luna-max" {
+		t.Fatalf("hooked review metadata was not preserved: %+v", fields)
+	}
 }
 
 func TestSlingFormulaRollsBackSpawnedPolecatOnWispFailure(t *testing.T) {

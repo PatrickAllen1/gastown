@@ -527,6 +527,7 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 		Args:            slingArgs,
 		Vars:            append([]string(nil), slingVars...),
 		AttachedFormula: formulaName,
+		AgentProfile:    slingAgent,
 		Mode:            &mode,
 		FormulaVars:     strings.Join(slingVars, "\n"),
 	}
@@ -553,10 +554,12 @@ func runSlingFormula(ctx context.Context, args []string) (err error) {
 	// Start spawned polecat session now that hook is set.
 	// This ensures polecat sees the wisp when gt prime runs on session start.
 	if resolved.NewPolecatInfo != nil {
-		pane, err := resolved.NewPolecatInfo.StartSession()
+		pane, err := startSpawnedPolecatSessionFn(resolved.NewPolecatInfo)
 		if err != nil {
-			// Rollback: unhook wisp, delete Dolt branch, clean up polecat worktree/agent bead
-			rollbackSlingArtifactsFn(resolved.NewPolecatInfo, wispRootID, "", "")
+			// Keep the hooked wisp and polecat identity intact. The startup failure
+			// is recoverable with `gt session start`; rollback would lose the
+			// requested runtime profile and workflow intent.
+			fmt.Printf("%s Session startup failed; preserving hooked formula for retry: %v\n", style.Warning.Render("⚠"), err)
 			return fmt.Errorf("starting polecat session: %w", err)
 		}
 		targetPane = pane

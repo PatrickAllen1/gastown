@@ -41,6 +41,7 @@ type AgentFields struct {
 	RoleType          string // polecat, witness, refinery, deacon, mayor
 	Rig               string // Rig name (empty for global agents like mayor/deacon)
 	AgentState        string // spawning, working, done, stuck, escalated, idle, running, nuked
+	AgentProfile      string // Requested runtime/profile override (for example, "codex" or "opencode acp")
 	HookBead          string // Currently pinned work bead ID
 	CleanupStatus     string // ZFC: polecat self-reports git state (clean, has_uncommitted, has_stash, has_unpushed)
 	ActiveMR          string // Currently active merge request bead ID (for traceability)
@@ -86,6 +87,10 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 	}
 
 	lines = append(lines, fmt.Sprintf("agent_state: %s", fields.AgentState))
+
+	if fields.AgentProfile != "" {
+		lines = append(lines, fmt.Sprintf("agent_profile: %s", fields.AgentProfile))
+	}
 
 	if fields.HookBead != "" {
 		lines = append(lines, fmt.Sprintf("hook_bead: %s", fields.HookBead))
@@ -171,6 +176,8 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.Rig = value
 		case "agent_state":
 			fields.AgentState = value
+		case "agent_profile", "agent-profile", "agentprofile":
+			fields.AgentProfile = value
 		case "hook_bead":
 			fields.HookBead = value
 		case "cleanup_status":
@@ -410,7 +417,9 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 
 	// Parse existing fields and clear mutable ones
 	fields := ParseAgentFields(issue.Description)
-	fields.HookBead = ""      // Clear hook_bead
+	fields.HookBead = "" // Clear hook_bead
+	// AgentProfile is intentionally preserved: a later session retry must use
+	// the profile selected for the durable polecat identity.
 	fields.ActiveMR = ""      // Clear active_mr
 	fields.CleanupStatus = "" // Clear cleanup_status
 	fields.Mode = ""          // Clear Ralph-mode threshold marker
@@ -458,6 +467,7 @@ func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 // cycle, avoiding races where concurrent callers overwrite each other's changes.
 type AgentFieldUpdates struct {
 	AgentState        *string // Sync description agent_state with column (gt-ulom)
+	AgentProfile      *string // Requested runtime/profile override
 	CleanupStatus     *string
 	ActiveMR          *string
 	NotificationLevel *string
@@ -508,6 +518,9 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 
 	if updates.AgentState != nil {
 		fields.AgentState = *updates.AgentState
+	}
+	if updates.AgentProfile != nil {
+		fields.AgentProfile = *updates.AgentProfile
 	}
 	if updates.CleanupStatus != nil {
 		fields.CleanupStatus = *updates.CleanupStatus

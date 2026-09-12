@@ -355,6 +355,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		Args:             params.Args,
 		Vars:             varsForAttachment,
 		AttachedMolecule: attachedMoleculeID,
+		AgentProfile:     params.Agent,
 		NoMerge:          params.NoMerge,
 		ReviewOnly:       params.ReviewOnly,
 		Mode:             &params.Mode,
@@ -415,10 +416,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 
 	// 11. Start polecat session
-	pane, err := spawnInfo.StartSession()
+	pane, err := startSpawnedPolecatSessionFn(spawnInfo)
 	if err != nil {
-		fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
-		rollbackSpawnedPolecat(beadToHook, "Session failed")
+		fmt.Printf("  %s Could not start session: %v; preserving hooked work for retry\n", style.Dim.Render("✗"), err)
 		result.ErrMsg = fmt.Sprintf("session failed: %v", err)
 		return result, fmt.Errorf("starting polecat session: %w", err)
 	}

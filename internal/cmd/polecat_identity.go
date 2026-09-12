@@ -165,6 +165,7 @@ type IdentityInfo struct {
 	Name           string `json:"name"`
 	BeadID         string `json:"bead_id"`
 	AgentState     string `json:"agent_state,omitempty"`
+	AgentProfile   string `json:"agent_profile,omitempty"`
 	HookBead       string `json:"hook_bead,omitempty"`
 	CleanupStatus  string `json:"cleanup_status,omitempty"`
 	WorktreeExists bool   `json:"worktree_exists"`
@@ -309,6 +310,7 @@ func runPolecatIdentityList(cmd *cobra.Command, args []string) error {
 			Name:           name,
 			BeadID:         id,
 			AgentState:     fields.AgentState,
+			AgentProfile:   fields.AgentProfile,
 			HookBead:       issue.HookBead,
 			CleanupStatus:  fields.CleanupStatus,
 			WorktreeExists: worktreeExists,
@@ -425,6 +427,7 @@ func runPolecatIdentityShow(cmd *cobra.Command, args []string) error {
 				Name:           polecatName,
 				BeadID:         beadID,
 				AgentState:     fields.AgentState,
+				AgentProfile:   fields.AgentProfile,
 				HookBead:       issue.HookBead,
 				CleanupStatus:  fields.CleanupStatus,
 				WorktreeExists: worktreeExists,
@@ -477,6 +480,10 @@ func runPolecatIdentityShow(cmd *cobra.Command, args []string) error {
 		stateStr = style.Dim.Render(stateStr)
 	}
 	fmt.Printf("  Agent State:   %s\n", stateStr)
+
+	if fields.AgentProfile != "" {
+		fmt.Printf("  Agent Profile: %s\n", fields.AgentProfile)
+	}
 
 	// Hook
 	hookBead := issue.HookBead
@@ -599,6 +606,7 @@ func runPolecatIdentityRename(cmd *cobra.Command, args []string) error {
 		CleanupStatus:     oldFields.CleanupStatus,
 		ActiveMR:          oldFields.ActiveMR,
 		NotificationLevel: oldFields.NotificationLevel,
+		AgentProfile:      oldFields.AgentProfile,
 	}
 
 	newTitle := fmt.Sprintf("Polecat %s in %s", newName, rigName)

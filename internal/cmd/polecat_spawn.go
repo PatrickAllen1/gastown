@@ -26,13 +26,14 @@ const minPolecatDirsPerRig = 30
 
 // SpawnedPolecatInfo contains info about a spawned polecat session.
 type SpawnedPolecatInfo struct {
-	RigName     string // Rig name (e.g., "gastown")
-	PolecatName string // Polecat name (e.g., "Toast")
-	ClonePath   string // Path to polecat's git worktree
-	SessionName string // Tmux session name (e.g., "gt-gastown-p-Toast")
-	Pane        string // Tmux pane ID (empty until StartSession is called)
-	BaseBranch  string // Effective base branch (e.g., "main", "integration/epic-id")
-	Branch      string // Git branch name (for cleanup on rollback)
+	RigName           string // Rig name (e.g., "gastown")
+	PolecatName       string // Polecat name (e.g., "Toast")
+	ClonePath         string // Path to polecat's git worktree
+	SessionName       string // Tmux session name (e.g., "gt-gastown-p-Toast")
+	Pane              string // Tmux pane ID (empty until StartSession is called)
+	HookSetAtomically bool   // HookBead was persisted while creating the identity
+	BaseBranch        string // Effective base branch (e.g., "main", "integration/epic-id")
+	Branch            string // Git branch name (for cleanup on rollback)
 
 	// Internal fields for deferred session start
 	account string
@@ -57,6 +58,7 @@ type SlingSpawnOptions struct {
 	Create        bool   // Create polecat if it doesn't exist (currently always true for sling)
 	HookBead      string // Bead ID to set as hook_bead at spawn time (atomic assignment)
 	Agent         string // Agent override for this spawn (e.g., "gemini", "codex", "claude-haiku")
+	PolecatName   string // Explicit polecat name to create or revive (empty = allocate/reuse)
 	BaseBranch    string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
 	ResumeBranch  string // Resume an existing branch (e.g. PR head) instead of creating polecat/<name>/<bead>+<ts>
 	SkipAdmission bool   // Caller already holds a polecat admission reservation
@@ -129,6 +131,15 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
 
+	// Validate explicit runtime profiles before allocating a name or mutating
+	// polecat state. A requested profile must never silently become the rig
+	// default on either the initial spawn or a retry.
+	if opts.Agent != "" {
+		if _, _, err := config.ResolveAgentConfigWithOverride(townRoot, r.Path, opts.Agent); err != nil {
+			return nil, fmt.Errorf("resolving agent config for %s: %w", opts.Agent, err)
+		}
+	}
+
 	// Pre-spawn Dolt health check (gt-94llt7): verify Dolt is reachable before
 	// allocating a polecat. Prevents orphaned polecats when Dolt is down.
 	if err := polecatMgr.CheckDoltHealth(); err != nil {
@@ -159,8 +170,8 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	}
 
 	// Per-bead respawn circuit breaker (clown show #22):
-	// Track how many times this bead has been slung. Block after N attempts
-	// to prevent witness→deacon→sling feedback loops.
+	// Track named and allocated respawns alike so an exact target cannot bypass
+	// the safety limit while recovering a repeatedly failing startup.
 	if opts.HookBead != "" && !opts.Force {
 		if witness.ShouldBlockRespawn(townRoot, opts.HookBead) {
 			maxRespawns := config.LoadOperationalConfig(townRoot).GetWitnessConfig().MaxBeadRespawnsV()
@@ -172,6 +183,13 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				opts.HookBead, rigName, opts.HookBead)
 		}
 		witness.RecordBeadRespawn(townRoot, opts.HookBead)
+	}
+
+	// An explicit polecat target must remain that polecat across a stopped
+	// session, a nuked identity, and a retry. Do this before idle-pool reuse so
+	// the requested identity is never replaced with an unrelated allocation.
+	if opts.PolecatName != "" {
+		return spawnNamedPolecatForSling(rigName, r, polecatMgr, t, opts)
 	}
 
 	if reclaimed, err := reclaimBrokenIdlePolecatForSling(polecatMgr); err != nil {
@@ -222,6 +240,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		// this worktree destructively.
 		addOpts := polecat.AddOptions{
 			HookBead:     opts.HookBead,
+			AgentProfile: opts.Agent,
 			BaseBranch:   baseBranch,
 			ResumeBranch: opts.ResumeBranch,
 		}
@@ -260,15 +279,16 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 			}
 
 			return &SpawnedPolecatInfo{
-				RigName:     rigName,
-				PolecatName: polecatName,
-				ClonePath:   polecatObj.ClonePath,
-				SessionName: sessionName,
-				Pane:        "",
-				BaseBranch:  effectiveBranch,
-				Branch:      polecatObj.Branch,
-				account:     opts.Account,
-				agent:       opts.Agent,
+				RigName:           rigName,
+				PolecatName:       polecatName,
+				ClonePath:         polecatObj.ClonePath,
+				SessionName:       sessionName,
+				Pane:              "",
+				BaseBranch:        effectiveBranch,
+				Branch:            polecatObj.Branch,
+				HookSetAtomically: opts.HookBead != "",
+				account:           opts.Account,
+				agent:             opts.Agent,
 			}, nil
 		}
 	}
@@ -324,6 +344,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Build add options with hook_bead set atomically at spawn time
 	addOpts := polecat.AddOptions{
 		HookBead:     opts.HookBead,
+		AgentProfile: opts.Agent,
 		BaseBranch:   baseBranch,
 		ResumeBranch: opts.ResumeBranch,
 	}
@@ -371,15 +392,116 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	}
 
 	return &SpawnedPolecatInfo{
-		RigName:     rigName,
-		PolecatName: polecatName,
-		ClonePath:   polecatObj.ClonePath,
-		SessionName: sessionName,
-		Pane:        "", // Empty until StartSession is called
-		BaseBranch:  effectiveBranch,
-		Branch:      polecatObj.Branch,
-		account:     opts.Account,
-		agent:       opts.Agent,
+		RigName:           rigName,
+		PolecatName:       polecatName,
+		ClonePath:         polecatObj.ClonePath,
+		SessionName:       sessionName,
+		Pane:              "", // Empty until StartSession is called
+		BaseBranch:        effectiveBranch,
+		Branch:            polecatObj.Branch,
+		HookSetAtomically: opts.HookBead != "",
+		account:           opts.Account,
+		agent:             opts.Agent,
+	}, nil
+}
+
+// spawnNamedPolecatForSling creates or revives the exact polecat requested by
+// the target. A named target is intentionally not routed through the idle pool:
+// doing so loses both the durable identity and the selected runtime profile.
+func spawnNamedPolecatForSling(rigName string, r *rig.Rig, polecatMgr *polecat.Manager, t *tmux.Tmux, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+	polecatName := opts.PolecatName
+	if polecatName == "" || polecatName == "." || polecatName == ".." || strings.ContainsAny(polecatName, "/\\") {
+		return nil, fmt.Errorf("invalid named polecat %q", polecatName)
+	}
+
+	polecatSessMgr := polecat.NewSessionManager(t, r)
+	sessionName := polecatSessMgr.SessionName(polecatName)
+	if running, err := t.HasSession(sessionName); err == nil && running {
+		return nil, fmt.Errorf("target polecat %s/%s has an active session but its pane could not be resolved", rigName, polecatName)
+	}
+
+	polecatDir := filepath.Join(r.Path, "polecats", polecatName)
+	polecatDirInfo, statErr := os.Stat(polecatDir)
+	if statErr == nil && polecatDirInfo.IsDir() {
+		polecatObj, err := polecatMgr.Get(polecatName)
+		if err != nil {
+			return nil, fmt.Errorf("getting named polecat %s: %w", polecatName, err)
+		}
+		if err := verifyWorktreeExists(polecatObj.ClonePath); err != nil {
+			return nil, fmt.Errorf("worktree verification failed for %s: %w", polecatName, err)
+		}
+		if opts.Agent != "" {
+			if err := polecatMgr.SetAgentProfile(polecatName, opts.Agent); err != nil {
+				return nil, fmt.Errorf("persisting agent profile for %s: %w", polecatName, err)
+			}
+		}
+
+		fmt.Printf("%s Polecat %s found (session start deferred)\n", style.Bold.Render("✓"), polecatName)
+		return &SpawnedPolecatInfo{
+			RigName:           rigName,
+			PolecatName:       polecatName,
+			ClonePath:         polecatObj.ClonePath,
+			SessionName:       sessionName,
+			BaseBranch:        polecatObj.Branch,
+			Branch:            polecatObj.Branch,
+			HookSetAtomically: false,
+			account:           opts.Account,
+			agent:             opts.Agent,
+		}, nil
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("checking named polecat %s: %w", polecatName, statErr)
+	}
+
+	// A nuked identity can outlive its worktree. If no new override is supplied,
+	// carry the identity's previous profile into the recreated worktree.
+	agentProfile := opts.Agent
+	if agentProfile == "" {
+		persisted, profileErr := polecatMgr.AgentProfile(polecatName)
+		if profileErr != nil {
+			return nil, fmt.Errorf("reading persisted agent profile for %s: %w", polecatName, profileErr)
+		}
+		agentProfile = persisted
+	}
+	baseBranch := opts.BaseBranch
+	if opts.ResumeBranch == "" && baseBranch != "" && !strings.HasPrefix(baseBranch, "origin/") {
+		baseBranch = "origin/" + baseBranch
+	}
+	addOpts := polecat.AddOptions{
+		HookBead:     opts.HookBead,
+		AgentProfile: agentProfile,
+		BaseBranch:   baseBranch,
+		ResumeBranch: opts.ResumeBranch,
+	}
+	if _, err := polecatMgr.AddWithOptions(polecatName, addOpts); err != nil {
+		return nil, fmt.Errorf("creating named polecat %s: %w", polecatName, err)
+	}
+	polecatObj, err := polecatMgr.Get(polecatName)
+	if err != nil {
+		return nil, fmt.Errorf("getting named polecat after creation: %w", err)
+	}
+	if err := verifyWorktreeExists(polecatObj.ClonePath); err != nil {
+		return nil, fmt.Errorf("worktree verification failed for %s: %w", polecatName, err)
+	}
+
+	effectiveBranch := strings.TrimPrefix(baseBranch, "origin/")
+	if effectiveBranch == "" {
+		effectiveBranch = r.DefaultBranch()
+	}
+	if opts.ResumeBranch != "" {
+		effectiveBranch = opts.ResumeBranch
+	}
+	fmt.Printf("%s Polecat %s created (session start deferred)\n", style.Bold.Render("✓"), polecatName)
+	return &SpawnedPolecatInfo{
+		RigName:           rigName,
+		PolecatName:       polecatName,
+		ClonePath:         polecatObj.ClonePath,
+		SessionName:       sessionName,
+		BaseBranch:        effectiveBranch,
+		Branch:            polecatObj.Branch,
+		HookSetAtomically: opts.HookBead != "",
+		account:           opts.Account,
+		agent:             agentProfile,
 	}, nil
 }
 
@@ -421,11 +543,18 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	// Start session
 	t := tmux.NewTmux()
 	polecatSessMgr := polecat.NewSessionManager(t, r)
+	agentProfile := s.agent
+	if agentProfile == "" {
+		agentProfile, err = polecatSessMgr.AgentProfile(s.PolecatName)
+		if err != nil {
+			return "", fmt.Errorf("resolving persisted agent profile: %w", err)
+		}
+	}
 
 	fmt.Printf("Starting session for %s/%s...\n", s.RigName, s.PolecatName)
 	startOpts := polecat.SessionStartOptions{
 		RuntimeConfigDir: claudeConfigDir,
-		Agent:            s.agent,
+		Agent:            agentProfile,
 	}
 	if err := polecatSessMgr.Start(s.PolecatName, startOpts); err != nil {
 		return "", fmt.Errorf("starting session: %w", err)
@@ -439,14 +568,12 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	// in a Codex session, always timing out after 30 seconds (gt-1j3m).
 	spawnTownRoot := filepath.Dir(r.Path)
 	var runtimeConfig *config.RuntimeConfig
-	if s.agent != "" {
-		rc, _, err := config.ResolveAgentConfigWithOverride(spawnTownRoot, r.Path, s.agent)
+	if agentProfile != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(spawnTownRoot, r.Path, agentProfile)
 		if err != nil {
-			style.PrintWarning("resolving agent config for %s: %v (using default)", s.agent, err)
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
-		} else {
-			runtimeConfig = rc
+			return "", fmt.Errorf("resolving agent config for %s: %w", agentProfile, err)
 		}
+		runtimeConfig = rc
 	} else {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
 	}

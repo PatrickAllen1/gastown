@@ -1009,6 +1009,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		slingMerge,
 		slingOwned,
 	)
+	fieldUpdates.AgentProfile = slingAgent
 
 	// Hook the bead with retry and verification.
 	// See: https://github.com/steveyegge/gastown/issues/148
@@ -1099,11 +1100,12 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// This ensures polecat sees the molecule when gt prime runs on session start.
 	freshlySpawned := newPolecatInfo != nil
 	if freshlySpawned {
-		pane, err := newPolecatInfo.StartSession()
+		pane, err := startSpawnedPolecatSessionFn(newPolecatInfo)
 		if err != nil {
-			// Rollback: session failed, clean up zombie artifacts (worktree, hooked bead).
-			// Without rollback, next sling attempt fails with "bead already hooked" (gt-jn40ft).
-			rollbackSpawnedPolecat("Session failed")
+			// Keep the polecat, hook, and workflow metadata intact. A startup
+			// dialog/runtime failure is recoverable with `gt session start`; rolling
+			// it back destroys the requested profile and review/no-merge intent.
+			fmt.Printf("%s Session startup failed; preserving hooked work for retry: %v\n", style.Warning.Render("⚠"), err)
 			return fmt.Errorf("starting polecat session: %w", err)
 		}
 		targetPane = pane
@@ -1199,6 +1201,12 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 
 // rollbackSlingArtifactsFn is a seam for tests. Production uses rollbackSlingArtifacts.
 var rollbackSlingArtifactsFn = rollbackSlingArtifacts
+
+// startSpawnedPolecatSessionFn is a seam for testing the handoff boundary.
+// Startup failures are recoverable and must not invoke sling rollback.
+var startSpawnedPolecatSessionFn = func(info *SpawnedPolecatInfo) (string, error) {
+	return info.StartSession()
+}
 
 // Rollback seams allow tests to assert molecule-cleanup behavior without
 // depending on full beads storage side effects.

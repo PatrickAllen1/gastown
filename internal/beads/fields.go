@@ -19,6 +19,7 @@ type AttachmentFields struct {
 	AttachedArgs     string   // Natural language args passed via gt sling --args (no-tmux mode)
 	AttachedVars     []string // Formula variables passed via gt sling --var
 	DispatchedBy     string   // Agent ID that dispatched this work (for completion notification)
+	AgentProfile     string   // Requested runtime/profile override for the assigned polecat
 	NoMerge          bool     // If true, gt done skips merge queue (for upstream PRs/human review)
 	ReviewOnly       bool     // If true, assignee must evaluate and report back — no merge/commit/push
 	Mode             string   // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
@@ -76,6 +77,9 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 			hasFields = true
 		case "dispatched_by", "dispatched-by", "dispatchedby":
 			fields.DispatchedBy = value
+			hasFields = true
+		case "agent_profile", "agent-profile", "agentprofile":
+			fields.AgentProfile = value
 			hasFields = true
 		case "no_merge", "no-merge", "nomerge":
 			fields.NoMerge = strings.ToLower(value) == "true"
@@ -137,6 +141,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.DispatchedBy != "" {
 		lines = append(lines, "dispatched_by: "+fields.DispatchedBy)
 	}
+	if fields.AgentProfile != "" {
+		lines = append(lines, "agent_profile: "+fields.AgentProfile)
+	}
 	if fields.NoMerge {
 		lines = append(lines, "no_merge: true")
 	}
@@ -188,6 +195,9 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"dispatched_by":     true,
 		"dispatched-by":     true,
 		"dispatchedby":      true,
+		"agent_profile":     true,
+		"agent-profile":     true,
+		"agentprofile":      true,
 		"no_merge":          true,
 		"no-merge":          true,
 		"nomerge":           true,

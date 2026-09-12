@@ -25,6 +25,7 @@ import (
 // Session command flags
 var (
 	sessionIssue               string
+	sessionAgent               string
 	sessionForce               bool
 	sessionLines               int
 	sessionMessage             string
@@ -61,7 +62,8 @@ and launches claude. Optionally inject an initial issue to work on.
 
 Examples:
   gt session start wyvern/Toast
-  gt session start wyvern/Toast --issue gt-123`,
+  gt session start wyvern/Toast --issue gt-123
+  gt session start wyvern/Toast --issue gt-123 --agent codex`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSessionStart,
 }
@@ -192,6 +194,7 @@ Examples:
 func init() {
 	// Start flags
 	sessionStartCmd.Flags().StringVar(&sessionIssue, "issue", "", "Issue ID to work on")
+	sessionStartCmd.Flags().StringVar(&sessionAgent, "agent", "", "Override agent/runtime for this session")
 
 	// Stop flags
 	sessionStopCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
@@ -312,6 +315,7 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 
 	opts := polecat.SessionStartOptions{
 		Issue: sessionIssue,
+		Agent: sessionAgent,
 	}
 
 	fmt.Printf("Starting session for %s/%s...\n", rigName, polecatName)

@@ -294,6 +294,78 @@ func (m *SessionManager) hasPolecat(polecat string) bool {
 	return info.IsDir()
 }
 
+// AgentProfile returns the durable runtime/profile override for a polecat.
+// A missing beads database or identity is treated as an empty profile so
+// legacy polecats continue to use the configured role default.
+func (m *SessionManager) AgentProfile(polecat string) (string, error) {
+	townRoot := filepath.Dir(m.rig.Path)
+	prefix := beads.GetPrefixForRig(townRoot, m.rig.Name)
+	agentID := beads.PolecatBeadIDWithPrefix(prefix, m.rig.Name, polecat)
+	agentBeads := beads.New(m.rig.Path).ForAgentBead()
+	_, fields, err := agentBeads.GetAgentBead(agentID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "does not exist") {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading agent profile for %s: %w", polecat, err)
+	}
+	if fields == nil {
+		return "", nil
+	}
+	return fields.AgentProfile, nil
+}
+
+func (m *SessionManager) agentProfileForStart(polecat, requested, issue string) (string, error) {
+	if requested != "" {
+		return requested, nil
+	}
+	profile, err := m.AgentProfile(polecat)
+	if err != nil {
+		return "", err
+	}
+	if profile != "" || issue == "" {
+		return profile, nil
+	}
+
+	// Identity beads are the primary durable source. The hooked work bead is a
+	// compatibility fallback for older polecats created before identity profile
+	// persistence was added.
+	issueBead, issueErr := beads.New(m.rig.Path).Show(issue)
+	if issueErr != nil {
+		if errors.Is(issueErr, beads.ErrNotInstalled) || strings.Contains(issueErr.Error(), "does not exist") {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading assigned work profile for %s: %w", polecat, issueErr)
+	}
+	if fields := beads.ParseAttachmentFields(issueBead); fields != nil {
+		return fields.AgentProfile, nil
+	}
+	return "", nil
+}
+
+func (m *SessionManager) persistAgentProfile(polecat, profile string) error {
+	if profile == "" {
+		return nil
+	}
+	townRoot := filepath.Dir(m.rig.Path)
+	prefix := beads.GetPrefixForRig(townRoot, m.rig.Name)
+	agentID := beads.PolecatBeadIDWithPrefix(prefix, m.rig.Name, polecat)
+	agentBeads := beads.New(m.rig.Path).ForAgentBead()
+	issue, _, err := agentBeads.GetAgentBead(agentID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "does not exist") {
+			return nil
+		}
+		return fmt.Errorf("reading agent bead for %s: %w", polecat, err)
+	}
+	if issue == nil {
+		return nil
+	}
+	return agentBeads.UpdateAgentDescriptionFields(agentID, beads.AgentFieldUpdates{
+		AgentProfile: &profile,
+	})
+}
+
 // polecatSlot returns a unique integer slot index for this polecat based on its
 // position among existing polecat directories. This enables port offsetting and
 // resource isolation when multiple polecats run in parallel (GH#954).
@@ -366,6 +438,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 	}
 
+	effectiveAgent, err := m.agentProfileForStart(polecat, opts.Agent, opts.Issue)
+	if err != nil {
+		return err
+	}
+	opts.Agent = effectiveAgent
+
 	// Resolve runtime config for the agent that will actually run in this session.
 	// When an explicit --agent override is provided (e.g., "codex"), use it to resolve
 	// the correct agent config. Without this, ResolveRoleAgentConfig returns the default
@@ -384,6 +462,9 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		runtimeConfig = rc
 	} else {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	}
+	if err := m.persistAgentProfile(polecat, opts.Agent); err != nil {
+		return fmt.Errorf("persisting agent profile for %s: %w", polecat, err)
 	}
 
 	// Ensure runtime settings exist in the shared polecats parent directory.

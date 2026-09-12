@@ -534,6 +534,109 @@ func TestAgentEnvOmitsGTAgent_FallbackRequired(t *testing.T) {
 	}
 }
 
+func TestAgentProfileForStartPrefersDurableIdentityAndWorkAttachment(t *testing.T) {
+	tests := []struct {
+		name            string
+		identityProfile string
+		workProfile     string
+		requested       string
+		want            string
+	}{
+		{
+			name:            "durable identity wins",
+			identityProfile: "codex",
+			workProfile:     "gemini",
+			want:            "codex",
+		},
+		{
+			name:        "work attachment is legacy fallback",
+			workProfile: "gemini",
+			want:        "gemini",
+		},
+		{
+			name:            "explicit request wins",
+			identityProfile: "codex",
+			workProfile:     "gemini",
+			requested:       "opencode acp",
+			want:            "opencode acp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+				t.Fatalf("mkdir mayor: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"version":1}`), 0644); err != nil {
+				t.Fatalf("write town marker: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+				t.Fatalf("mkdir beads: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644); err != nil {
+				t.Fatalf("write routes: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+				t.Fatalf("mkdir rig: %v", err)
+			}
+
+			binDir := t.TempDir()
+			identityDesc := "agent_profile: " + tt.identityProfile
+			workDesc := "agent_profile: " + tt.workProfile
+			identityJSON := fmt.Sprintf(`[{"id":"gt-gastown-polecat-toast","issue_type":"task","labels":["gt:agent"],"status":"open","description":"%s"}]`, identityDesc)
+			workJSON := fmt.Sprintf(`[{"id":"gt-work","issue_type":"task","status":"open","description":"%s"}]`, workDesc)
+			script := fmt.Sprintf(`#!/bin/sh
+cmd=""
+id=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    version) echo "bd test"; exit 0 ;;
+    show) cmd="show" ;;
+    *)
+      if [ "$cmd" = "show" ] && [ -z "$id" ]; then id="$arg"; fi
+      ;;
+  esac
+done
+if [ "$cmd" = "show" ]; then
+  if [ "$id" = "gt-gastown-polecat-toast" ]; then
+    printf '%%s\n' '%s'
+  else
+    printf '%%s\n' '%s'
+  fi
+fi
+exit 0
+`, identityJSON, workJSON)
+			bdPath := filepath.Join(binDir, "bd")
+			if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+				t.Fatalf("write bd stub: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			r := &rig.Rig{Name: "gastown", Path: filepath.Join(townRoot, "gastown")}
+			sm := NewSessionManager(tmux.NewTmux(), r)
+			got, err := sm.agentProfileForStart("toast", tt.requested, "gt-work")
+			if err != nil {
+				t.Fatalf("agentProfileForStart: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("agentProfileForStart = %q, want %q", got, tt.want)
+			}
+
+			env := config.AgentEnv(config.AgentEnvConfig{
+				Role:      "polecat",
+				Rig:       "gastown",
+				AgentName: "toast",
+				Agent:     got,
+			})
+			if env["GT_AGENT"] != tt.want {
+				t.Fatalf("GT_AGENT = %q, want %q", env["GT_AGENT"], tt.want)
+			}
+		})
+	}
+}
+
 // TestVerifyStartupNudgeDelivery_IdleAgent tests that verifyStartupNudgeDelivery
 // detects an idle agent (at prompt, no busy indicator) and retries the nudge.
 // Uses a real tmux session with a shell prompt that matches the ReadyPromptPrefix.

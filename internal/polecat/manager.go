@@ -362,6 +362,20 @@ func (m *Manager) resetAgentBeadForReuse(agentID, reason string) error {
 	return m.agentBeads().ResetAgentBeadForReuse(agentID, reason)
 }
 
+// resolveRuntimeConfig selects the runtime config that a polecat will use.
+// Explicit profiles are strict: a requested profile must resolve successfully
+// instead of silently falling back to the rig default.
+func (m *Manager) resolveRuntimeConfig(agentProfile string) (*config.RuntimeConfig, error) {
+	if agentProfile != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(m.townRoot, m.rig.Path, agentProfile)
+		if err != nil {
+			return nil, fmt.Errorf("resolving agent config for %s: %w", agentProfile, err)
+		}
+		return rc, nil
+	}
+	return config.ResolveRoleAgentConfig("polecat", m.townRoot, m.rig.Path), nil
+}
+
 // SetAgentStateWithRetry wraps SetAgentState with retry logic.
 // Returns an error after exhausting retries, but callers may choose to warn
 // rather than fail — e.g., in StartSession where the tmux session is already
@@ -531,8 +545,9 @@ func (m *Manager) exists(name string) bool {
 
 // AddOptions configures polecat creation.
 type AddOptions struct {
-	HookBead   string // Bead ID to set as hook_bead at spawn time (atomic assignment)
-	BaseBranch string // Override base branch for worktree (e.g., "origin/integration/gt-epic")
+	HookBead     string // Bead ID to set as hook_bead at spawn time (atomic assignment)
+	AgentProfile string // Requested runtime/profile override for this polecat session
+	BaseBranch   string // Override base branch for worktree (e.g., "origin/integration/gt-epic")
 	// ResumeBranch reuses an existing branch (typically a PR head) for the polecat
 	// worktree instead of creating a fresh polecat/<name>/<bead>+<ts> branch (gh#3602).
 	// When set, the polecat's branch IS this branch — pushes go back to the same ref,
@@ -660,6 +675,10 @@ func (m *Manager) Add(name string) (*Polecat, error) {
 // (GH#2215) by holding the pool lock through directory creation, ensuring
 // no concurrent process can allocate the same name.
 func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
+	if _, err := m.resolveRuntimeConfig(opts.AgentProfile); err != nil {
+		return "", nil, err
+	}
+
 	// Hold pool lock across allocation + directory creation to close the
 	// race window where a concurrent AllocateName could miss the pending
 	// marker and reallocate the same name.
@@ -724,6 +743,11 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 // Caller MUST hold the polecat lock and have already created polecatDir.
 func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir string) (_ *Polecat, retErr error) {
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
+
+	runtimeConfig, err := m.resolveRuntimeConfig(opts.AgentProfile)
+	if err != nil {
+		return nil, err
+	}
 
 	// Pre-check: Verify sufficient disk space before expensive worktree creation.
 	if level, msg, err := util.CheckDiskSpace(m.rig.Path); err == nil && level == util.DiskSpaceCritical {
@@ -832,8 +856,6 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		style.PrintWarning("could not update local git excludes: %v", err)
 	}
 
-	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(polecatSettingsDir, clonePath, "polecat", runtimeConfig); err != nil {
 		style.PrintWarning("could not install runtime settings: %v", err)
@@ -849,10 +871,11 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 
 	agentID := m.agentBeadID(name)
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead,
+		RoleType:     "polecat",
+		Rig:          m.rig.Name,
+		AgentState:   "spawning",
+		AgentProfile: opts.AgentProfile,
+		HookBead:     opts.HookBead,
 	}); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
@@ -886,6 +909,11 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 
 	if m.exists(name) {
 		return nil, ErrPolecatExists
+	}
+
+	runtimeConfig, err := m.resolveRuntimeConfig(opts.AgentProfile)
+	if err != nil {
+		return nil, err
 	}
 
 	// Pre-check: Verify sufficient disk space before creating worktree.
@@ -1054,8 +1082,6 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 
 	// Install runtime settings in the shared polecats parent directory.
 	// Settings are passed to Claude Code via --settings flag.
-	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(polecatSettingsDir, clonePath, "polecat", runtimeConfig); err != nil {
 		// Non-fatal - log warning but continue
@@ -1083,10 +1109,11 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	// Retries with backoff — a polecat without an agent bead is untrackable (gt-94llt7).
 	agentID := m.agentBeadID(name)
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead, // Set atomically at spawn time
+		RoleType:     "polecat",
+		Rig:          m.rig.Name,
+		AgentState:   "spawning",
+		AgentProfile: opts.AgentProfile,
+		HookBead:     opts.HookBead, // Set atomically at spawn time
 	}); err != nil {
 		// Hard fail — an untrackable polecat is worse than no polecat
 		cleanupOnError()
@@ -1716,10 +1743,11 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// Uses CreateOrReopenAgentBead to handle re-spawning with same name (GH #332).
 	// Retries with backoff — a polecat without an agent bead is untrackable (gt-94llt7).
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead, // Set atomically at spawn time
+		RoleType:     "polecat",
+		Rig:          m.rig.Name,
+		AgentState:   "spawning",
+		AgentProfile: opts.AgentProfile,
+		HookBead:     opts.HookBead, // Set atomically at spawn time
 	}); err != nil {
 		// Hard fail — clean up the new worktree since we can't track this polecat
 		_ = repoGit.WorktreeRemove(newClonePath, true)
@@ -1764,6 +1792,9 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	if !m.exists(name) {
 		return nil, ErrPolecatNotFound
+	}
+	if _, err := m.resolveRuntimeConfig(opts.AgentProfile); err != nil {
+		return nil, err
 	}
 	current, err := m.loadFromBeads(name)
 	if err != nil {
@@ -1915,10 +1946,11 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	// Create or reopen agent bead with hook_bead set atomically
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead,
+		RoleType:     "polecat",
+		Rig:          m.rig.Name,
+		AgentState:   "spawning",
+		AgentProfile: opts.AgentProfile,
+		HookBead:     opts.HookBead,
 	}); err != nil {
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
@@ -2568,6 +2600,35 @@ func (m *Manager) SetAgentState(name string, state string) error {
 	// Agent beads live in the town DB — bypass prefix routing that would
 	// otherwise misroute "za-*" / "my-*" agent IDs to a rig DB.
 	return m.agentBeads().UpdateAgentState(agentID, state)
+}
+
+// SetAgentProfile records the runtime/profile override selected for a polecat.
+// The profile is durable so a stopped session can be retried without reverting
+// to the rig default.
+func (m *Manager) SetAgentProfile(name, profile string) error {
+	if profile == "" {
+		return nil
+	}
+	if _, err := m.resolveRuntimeConfig(profile); err != nil {
+		return err
+	}
+	return m.agentBeads().UpdateAgentDescriptionFields(m.agentBeadID(name), beads.AgentFieldUpdates{
+		AgentProfile: &profile,
+	})
+}
+
+// AgentProfile returns the durable runtime/profile override for a polecat.
+// Missing identity beads and empty profiles both mean "use the configured
+// polecat default".
+func (m *Manager) AgentProfile(name string) (string, error) {
+	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		return "", err
+	}
+	if fields == nil {
+		return "", nil
+	}
+	return fields.AgentProfile, nil
 }
 
 // - StateDone: assignee cleared from issue (polecat ready for cleanup)

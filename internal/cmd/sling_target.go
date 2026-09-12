@@ -284,6 +284,9 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 				ResumeBranch:  opts.ResumeBranch,
 				SkipAdmission: opts.SkipPolecatAdmission,
 			}
+			if namedPolecat, named := explicitNamedPolecatTarget(target); named {
+				spawnOpts.PolecatName = namedPolecat
+			}
 			spawnInfo, spawnErr := spawnPolecatForSling(rigName, spawnOpts)
 			if spawnErr != nil {
 				return nil, fmt.Errorf("spawning polecat to replace dead polecat: %w", spawnErr)
@@ -291,7 +294,10 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			result.Agent = spawnInfo.AgentID()
 			result.NewPolecatInfo = spawnInfo
 			result.WorkDir = spawnInfo.ClonePath
-			result.HookSetAtomically = opts.HookBead != ""
+			result.HookSetAtomically = spawnInfo.HookSetAtomically
+			if spawnOpts.PolecatName == "" && opts.HookBead != "" {
+				result.HookSetAtomically = true
+			}
 			if !opts.NoBoot {
 				wakeRigAgents(rigName)
 			}
@@ -318,6 +324,17 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 		result.IsSelfSling = true
 	}
 	return result, nil
+}
+
+// explicitNamedPolecatTarget extracts the exact identity from the full
+// rig/polecats/name target form. Shorthand targets intentionally continue to
+// use the existing allocation behavior.
+func explicitNamedPolecatTarget(target string) (string, bool) {
+	parts := strings.Split(target, "/")
+	if len(parts) != 3 || parts[1] != "polecats" || parts[0] == "" || parts[2] == "" {
+		return "", false
+	}
+	return parts[2], true
 }
 
 func missingPolecatTargetRig(target string, allowShorthand bool, townRoot string) (string, bool) {
