@@ -459,6 +459,10 @@ func getPolecatManager(rigName string) (*polecat.Manager, *rig.Rig, error) {
 	return mgr, r, nil
 }
 
+func listCanonicalPolecatAgentBeads(rigBeads *beads.Beads) (map[string]*beads.Issue, error) {
+	return rigBeads.ForAgentBead().ListAgentBeads()
+}
+
 func runPolecatList(cmd *cobra.Command, args []string) error {
 	var rigs []*rig.Rig
 
@@ -498,7 +502,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "warning: failed to list polecats in %s: %v\n", r.Name, err)
 			continue
 		}
-		agents, agentErr := bd.ListAgentBeads()
+		agents, agentErr := listCanonicalPolecatAgentBeads(bd)
 		if agentErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to list agent beads in %s: %v\n", r.Name, agentErr)
 			agents = nil

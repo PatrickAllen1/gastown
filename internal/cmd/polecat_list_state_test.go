@@ -2,11 +2,70 @@ package cmd
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/polecat"
 )
+
+func TestListCanonicalPolecatAgentBeadsUsesTownScope(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell bd stub")
+	}
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd-calls.log")
+	bdPath := filepath.Join(binDir, "bd")
+	bdScript := `#!/bin/sh
+printf '%s|%s\n' "$PWD" "${BEADS_DIR-}" >> "$GT_CANONICAL_LOG"
+case "$*" in
+  *"mol"*"wisp"*"list"*) printf '{"wisps":[]}\n' ;;
+  *"list"*) printf '[]\n' ;;
+  *"version"*) printf 'bd 1.0.0\n' ;;
+  *) printf '[]\n' ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_CANONICAL_LOG", logPath)
+	t.Setenv("BEADS_DIR", filepath.Join(townRoot, "wrong", ".beads"))
+
+	if _, err := listCanonicalPolecatAgentBeads(beads.New(rigPath)); err != nil {
+		t.Fatalf("list canonical agent beads: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	log := string(logBytes)
+	wantScope := townRoot + "|" + filepath.Join(townRoot, ".beads")
+	if !strings.Contains(log, wantScope) {
+		t.Fatalf("canonical agent lookup did not use town scope %q:\n%s", wantScope, log)
+	}
+	wrongScope := rigPath + "|" + filepath.Join(rigPath, ".beads")
+	if strings.Contains(log, wrongScope) {
+		t.Fatalf("canonical agent lookup leaked rig scope %q:\n%s", wrongScope, log)
+	}
+}
 
 type fakeReuseMRShower struct {
 	issue *beads.Issue
