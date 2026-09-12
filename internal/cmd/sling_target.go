@@ -280,6 +280,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 				Create:        opts.Create,
 				HookBead:      opts.HookBead,
 				Agent:         opts.Agent,
+				PolecatName:   polecatNameForTarget(target, opts.Create, opts.TownRoot),
 				BaseBranch:    opts.BaseBranch,
 				ResumeBranch:  opts.ResumeBranch,
 				SkipAdmission: opts.SkipPolecatAdmission,
@@ -291,7 +292,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			result.Agent = spawnInfo.AgentID()
 			result.NewPolecatInfo = spawnInfo
 			result.WorkDir = spawnInfo.ClonePath
-			result.HookSetAtomically = opts.HookBead != ""
+			result.HookSetAtomically = spawnInfo.HookSetAtomically || opts.HookBead != ""
 			if !opts.NoBoot {
 				wakeRigAgents(rigName)
 			}
@@ -341,4 +342,21 @@ func missingPolecatTargetRig(target string, allowShorthand bool, townRoot string
 		}
 	}
 	return parts[0], true
+}
+
+// polecatNameForTarget preserves an explicit polecat identity through the
+// resolver-to-spawn seam. Exact rig/polecats/name targets always name the
+// requested identity; rig/name is accepted only when the existing shorthand
+// resolver has established that it is not a crew target.
+func polecatNameForTarget(target string, allowShorthand bool, townRoot string) string {
+	parts := strings.Split(target, "/")
+	if len(parts) == 3 && parts[0] != "" && parts[1] == "polecats" && parts[2] != "" {
+		return parts[2]
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		if _, ok := missingPolecatTargetRig(target, allowShorthand, townRoot); ok {
+			return parts[1]
+		}
+	}
+	return ""
 }
