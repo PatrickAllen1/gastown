@@ -6,7 +6,8 @@
 // - Timestamp when lock was acquired
 // - Session ID (tmux session name)
 //
-// Stale locks (where the PID is dead) are automatically cleaned up.
+// Locks with dead owner PIDs are automatically cleaned up when no matching
+// tmux session is active.
 package lock
 
 import (
@@ -30,15 +31,38 @@ var (
 
 // LockInfo contains information about who holds a lock.
 type LockInfo struct {
-	PID       int       `json:"pid"`
+	PID        int       `json:"pid"`
 	AcquiredAt time.Time `json:"acquired_at"`
-	SessionID string    `json:"session_id,omitempty"`
-	Hostname  string    `json:"hostname,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	Hostname   string    `json:"hostname,omitempty"`
 }
 
 // IsStale checks if the lock is stale (owning process is dead).
 func (l *LockInfo) IsStale() bool {
 	return !processExists(l.PID)
+}
+
+// IsTrulyStale reports whether a lock can safely be recovered.
+//
+// The process that acquired an identity lock is short-lived: it may exit after
+// starting the agent in tmux. A dead PID therefore does not make a lock stale
+// when its recorded tmux session identifier is still active. Callers should
+// pass all identifiers accepted in lock files (session names, $N session IDs,
+// and %N pane IDs).
+func IsTrulyStale(info *LockInfo, activeSessionIDs []string) bool {
+	if info == nil || !info.IsStale() {
+		return false
+	}
+
+	if info.SessionID == "" {
+		return true
+	}
+	for _, sessionID := range activeSessionIDs {
+		if info.SessionID == sessionID {
+			return false
+		}
+	}
+	return true
 }
 
 // Lock represents an agent identity lock for a worker directory.
@@ -269,20 +293,10 @@ func CleanStaleLocks(root string) (int, error) {
 
 	// Get active tmux sessions to verify locks
 	activeSessions := getActiveTmuxSessions()
-	sessionSet := make(map[string]bool)
-	for _, s := range activeSessions {
-		sessionSet[s] = true
-	}
 
 	cleaned := 0
 	for workerDir, info := range locks {
-		if info.IsStale() {
-			// PID is dead, but check if session still exists
-			if info.SessionID != "" && sessionSet[info.SessionID] {
-				// Session exists - worker is alive, don't clean
-				continue
-			}
-			// Both PID dead AND no session = truly stale
+		if IsTrulyStale(info, activeSessions) {
 			lock := New(workerDir)
 			if err := lock.Release(); err == nil {
 				cleaned++
@@ -410,7 +424,7 @@ func DetectCollisions(root string, activeSessions []string) []string {
 	}
 
 	for workerDir, info := range locks {
-		if info.IsStale() {
+		if IsTrulyStale(info, activeSessions) {
 			collisions = append(collisions,
 				fmt.Sprintf("stale lock in %s (dead PID %d, session: %s)",
 					workerDir, info.PID, info.SessionID))

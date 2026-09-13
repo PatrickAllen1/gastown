@@ -112,7 +112,7 @@ Output shows:
   - Active tmux sessions with gt- prefix
   - Identity locks in worker directories
   - Collisions (multiple agents claiming same identity)
-  - Stale locks (dead PIDs)`,
+  - Stale locks (dead PIDs with no matching tmux session)`,
 	RunE: runAgentsCheck,
 }
 
@@ -122,7 +122,7 @@ var agentsFixCmd = &cobra.Command{
 	Long: `Clean up identity collisions and stale locks.
 
 This command:
-  1. Removes stale locks (where the PID is dead)
+  1. Removes stale locks (where the PID is dead and no matching tmux session exists)
   2. Reports collisions that need manual intervention
 
 For collisions with live processes, you must manually:
@@ -682,15 +682,40 @@ func runAgentsFix(cmd *cobra.Command, args []string) error {
 }
 
 func buildCollisionReport(townRoot string) (*CollisionReport, error) {
-	report := &CollisionReport{
-		Locks: make(map[string]*lock.LockInfo),
-	}
-
-	// Get all tmux sessions
+	// Get all tmux sessions and the identifiers that may be recorded in locks.
+	// Locks created from inside tmux store TMUX_PANE (%N), while older formats
+	// may store a session name or session ID ($N). Keep all of them in the
+	// liveness set so check and fix agree on whether a dead PID is recoverable.
 	t := tmux.NewTmux()
 	sessions, err := t.ListSessions()
 	if err != nil {
 		sessions = []string{} // Continue even if tmux not running
+	}
+
+	activeSessionIDs := append([]string(nil), sessions...)
+	if sessionIDs, idsErr := t.ListSessionIDs(); idsErr == nil {
+		for _, id := range sessionIDs {
+			activeSessionIDs = append(activeSessionIDs, id)
+			// A lock may contain TMUX_PANE (%N), while tmux reports the
+			// owning session as $N. Preserve the historical alternate form
+			// accepted by lock.CleanStaleLocks as well.
+			if len(id) > 0 {
+				switch id[0] {
+				case '$':
+					activeSessionIDs = append(activeSessionIDs, "%"+id[1:])
+				case '%':
+					activeSessionIDs = append(activeSessionIDs, "$"+id[1:])
+				}
+			}
+		}
+	}
+
+	return buildCollisionReportForSessions(townRoot, sessions, activeSessionIDs)
+}
+
+func buildCollisionReportForSessions(townRoot string, sessions, activeSessionIDs []string) (*CollisionReport, error) {
+	report := &CollisionReport{
+		Locks: make(map[string]*lock.LockInfo),
 	}
 
 	// Filter to Gas Town sessions
@@ -712,7 +737,7 @@ func buildCollisionReport(townRoot string) (*CollisionReport, error) {
 
 	// Check each lock for issues
 	for workerDir, lockInfo := range locks {
-		if lockInfo.IsStale() {
+		if lock.IsTrulyStale(lockInfo, activeSessionIDs) {
 			report.StaleLocks++
 			report.Issues = append(report.Issues, CollisionIssue{
 				Type:      "stale",

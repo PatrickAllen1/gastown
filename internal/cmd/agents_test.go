@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -627,5 +628,87 @@ func TestGuessSessionFromWorkerDir(t *testing.T) {
 					tt.workerDir, townRoot, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBuildCollisionReport_RetainsDeadPIDWithActiveSession(t *testing.T) {
+	setupCmdTestRegistry(t)
+	townRoot := t.TempDir()
+	workerDir := filepath.Join(townRoot, "gastown", "polecats", "furiosa")
+	lockDir := filepath.Join(workerDir, ".runtime")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockInfo := map[string]interface{}{
+		"pid":        999999999,
+		"session_id": "%42",
+	}
+	data, err := json.Marshal(lockInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockDir, "agent.lock"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The recorded lock PID is dead, but the matching tmux pane identifier
+	// remains active under the worker's live session. This is the normal
+	// post-spawn state that agents fix already preserves.
+	report, err := buildCollisionReportForSessions(
+		townRoot,
+		[]string{"gt-furiosa"},
+		[]string{"gt-furiosa", "$42", "%42"},
+	)
+	if err != nil {
+		t.Fatalf("buildCollisionReportForSessions() error = %v", err)
+	}
+
+	if report.StaleLocks != 0 {
+		t.Fatalf("StaleLocks = %d, want 0 for a dead PID with an active session", report.StaleLocks)
+	}
+	if report.Collisions != 0 {
+		t.Fatalf("Collisions = %d, want 0 for the matching active session", report.Collisions)
+	}
+	if len(report.Issues) != 0 {
+		t.Fatalf("Issues = %+v, want no issues", report.Issues)
+	}
+}
+
+func TestBuildCollisionReport_DetectsDeadPIDWithoutSession(t *testing.T) {
+	setupCmdTestRegistry(t)
+	townRoot := t.TempDir()
+	workerDir := filepath.Join(townRoot, "gastown", "polecats", "furiosa")
+	lockDir := filepath.Join(workerDir, ".runtime")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockInfo := map[string]interface{}{
+		"pid":        999999999,
+		"session_id": "%99",
+	}
+	data, err := json.Marshal(lockInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockDir, "agent.lock"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := buildCollisionReportForSessions(
+		townRoot,
+		[]string{"gt-furiosa"},
+		[]string{"gt-furiosa"},
+	)
+	if err != nil {
+		t.Fatalf("buildCollisionReportForSessions() error = %v", err)
+	}
+
+	if report.StaleLocks != 1 {
+		t.Fatalf("StaleLocks = %d, want 1 for a dead PID without an active session", report.StaleLocks)
+	}
+	if len(report.Issues) != 1 || report.Issues[0].Type != "stale" {
+		t.Fatalf("Issues = %+v, want one stale issue", report.Issues)
 	}
 }

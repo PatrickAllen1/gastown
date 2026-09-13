@@ -26,8 +26,8 @@ func TestNew(t *testing.T) {
 
 func TestLockInfo_IsStale(t *testing.T) {
 	tests := []struct {
-		name     string
-		pid      int
+		name      string
+		pid       int
 		wantStale bool
 	}{
 		{"current process", os.Getpid(), false},
@@ -41,6 +41,50 @@ func TestLockInfo_IsStale(t *testing.T) {
 			info := &LockInfo{PID: tt.pid}
 			if got := info.IsStale(); got != tt.wantStale {
 				t.Errorf("IsStale() = %v, want %v", got, tt.wantStale)
+			}
+		})
+	}
+}
+
+func TestIsTrulyStale(t *testing.T) {
+	tests := []struct {
+		name             string
+		info             *LockInfo
+		activeSessionIDs []string
+		wantTrulyStale   bool
+	}{
+		{
+			name:           "dead PID with no session",
+			info:           &LockInfo{PID: 999999999},
+			wantTrulyStale: true,
+		},
+		{
+			name:             "dead PID with active session name",
+			info:             &LockInfo{PID: 999999999, SessionID: "gt-furiosa"},
+			activeSessionIDs: []string{"gt-furiosa"},
+			wantTrulyStale:   false,
+		},
+		{
+			name:             "dead PID with active session ID",
+			info:             &LockInfo{PID: 999999999, SessionID: "%42"},
+			activeSessionIDs: []string{"gt-furiosa", "$42", "%42"},
+			wantTrulyStale:   false,
+		},
+		{
+			name:           "live PID without session",
+			info:           &LockInfo{PID: os.Getpid(), SessionID: "missing"},
+			wantTrulyStale: false,
+		},
+		{
+			name:           "nil lock",
+			wantTrulyStale: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTrulyStale(tt.info, tt.activeSessionIDs); got != tt.wantTrulyStale {
+				t.Errorf("IsTrulyStale() = %v, want %v", got, tt.wantTrulyStale)
 			}
 		})
 	}
@@ -451,6 +495,47 @@ func TestCleanStaleLocks(t *testing.T) {
 	liveLockPath := filepath.Join(liveDir, "agent.lock")
 	if _, err := os.Stat(liveLockPath); err != nil {
 		t.Error("Live lock file should still exist")
+	}
+}
+
+func TestCleanStaleLocks_RetainsDeadPIDWithActiveSession(t *testing.T) {
+	// Save and restore execCommand
+	origExecCommand := execCommand
+	defer func() { execCommand = origExecCommand }()
+
+	// The lock records a pane/session identifier that is still active even
+	// though the process that created the lock has exited.
+	execCommand = func(name string, args ...string) interface{ Output() ([]byte, error) } {
+		return &mockCmd{output: []byte("gt-furiosa:$42\n")}
+	}
+
+	tmpDir := t.TempDir()
+	runtimeDir := filepath.Join(tmpDir, "gastown", "polecats", "furiosa", ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := json.Marshal(LockInfo{
+		PID:       999999999,
+		SessionID: "%42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(runtimeDir, "agent.lock")
+	if err := os.WriteFile(lockPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cleaned, err := CleanStaleLocks(tmpDir)
+	if err != nil {
+		t.Fatalf("CleanStaleLocks() error = %v", err)
+	}
+	if cleaned != 0 {
+		t.Fatalf("CleanStaleLocks() cleaned %d locks, want 0", cleaned)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("active-session lock was removed: %v", err)
 	}
 }
 
