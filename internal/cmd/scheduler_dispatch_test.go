@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 )
@@ -43,6 +44,42 @@ case "$BEADS_DIR" in
 esac
 `)
 	return townRoot
+}
+
+func TestBeadsSearchDirsUsesRegisteredRoutes(t *testing.T) {
+	townRoot := t.TempDir()
+	activeRig := filepath.Join(townRoot, "active", "mayor", "rig")
+	staleCheckout := filepath.Join(townRoot, "historical-checkout")
+	for _, dir := range []string{
+		filepath.Join(townRoot, ".beads"),
+		filepath.Join(activeRig, ".beads"),
+		filepath.Join(staleCheckout, ".beads"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := beads.WriteRoutes(filepath.Join(townRoot, ".beads"), []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "act-", Path: "active/mayor/rig"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	dirs, err := beadsSearchDirs(townRoot)
+	if err != nil {
+		t.Fatalf("beadsSearchDirs: %v", err)
+	}
+
+	want := []string{townRoot, activeRig}
+	if len(dirs) != len(want) {
+		t.Fatalf("beadsSearchDirs = %v, want %v", dirs, want)
+	}
+	for i := range want {
+		if dirs[i] != want[i] {
+			t.Errorf("beadsSearchDirs[%d] = %q, want %q", i, dirs[i], want[i])
+		}
+	}
 }
 
 func TestDispatchScheduledWorkReportsHeldLock(t *testing.T) {
