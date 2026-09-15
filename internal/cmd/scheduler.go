@@ -423,10 +423,58 @@ func scheduledBeadInfoFromWork(ctxTitle string, fields *capacity.SlingContextFie
 }
 
 // beadsSearchDirs returns directories to scan for scheduled beads:
-// the town root plus any rig directories that have a .beads/ subdirectory.
+// the town root plus the beads directories registered in routes.jsonl.
+//
+// A town can contain historical rig checkouts (for example, a worktree kept
+// around for an old analysis run) that still have a .beads directory. Those
+// directories are not scheduler databases and may point at a Dolt database
+// that no longer exists. Scanning every child directory makes an unrelated
+// stale checkout break scheduler status, and—if the error is ignored—could
+// hide a real context and permit duplicate dispatch. Routes are the
+// authoritative list of databases that belong to this town, so prefer them
+// whenever at least one rig route is configured.
+//
+// When routes.jsonl is absent or only contains the town route, retain the
+// filesystem fallback for standalone/test towns that do not have a registry
+// yet. Errors from registered databases remain fail-closed in
+// listAllSlingContextRecords.
 func beadsSearchDirs(townRoot string) ([]string, error) {
 	dirs := []string{townRoot}
 	seen := map[string]bool{townRoot: true}
+
+	routes, err := beads.LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		return nil, fmt.Errorf("discovering scheduler beads routes: %w", err)
+	}
+
+	hasRigRoute := false
+	for _, route := range routes {
+		if route.Path != "." {
+			hasRigRoute = true
+			break
+		}
+	}
+	if hasRigRoute {
+		for _, route := range routes {
+			if route.Path == "." {
+				continue
+			}
+			rigDir := filepath.Clean(filepath.Join(townRoot, route.Path))
+			if !schedulerPathWithin(townRoot, rigDir) {
+				continue
+			}
+			beadsDir := filepath.Join(rigDir, ".beads")
+			if info, statErr := os.Stat(beadsDir); statErr == nil && info.IsDir() && !seen[rigDir] {
+				dirs = append(dirs, rigDir)
+				seen[rigDir] = true
+			}
+		}
+		return dirs, nil
+	}
+
+	// Standalone/test towns may not have routes yet. Preserve the historical
+	// discovery behavior in that case so a newly initialized rig can still be
+	// scheduled before its route is written.
 	entries, err := os.ReadDir(townRoot)
 	if err != nil {
 		return nil, fmt.Errorf("discovering scheduler beads search dirs: %w", err)
@@ -449,6 +497,14 @@ func beadsSearchDirs(townRoot string) ([]string, error) {
 		}
 	}
 	return dirs, nil
+}
+
+func schedulerPathWithin(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
 }
 
 // countActivePolecats counts all running polecat tmux sessions across all rigs.
