@@ -157,8 +157,8 @@ var shellHookScript = `#!/bin/zsh
 # Location: ~/.config/gastown/shell-hook.sh
 
 _gastown_enabled() {
-    [[ -n "$GASTOWN_DISABLED" ]] && return 1
-    [[ -n "$GASTOWN_ENABLED" ]] && return 0
+    [[ -n "${GASTOWN_DISABLED:-}" ]] && return 1
+    [[ -n "${GASTOWN_ENABLED:-}" ]] && return 0
     local state_file="$HOME/.local/state/gastown/state.json"
     [[ -f "$state_file" ]] && grep -q '"enabled":\s*true' "$state_file" 2>/dev/null
 }

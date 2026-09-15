@@ -2,7 +2,9 @@ package wrappers
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -196,4 +198,101 @@ func TestInstall_Idempotent(t *testing.T) {
 			t.Errorf("Wrapper %s content doesn't match embedded script after double install", name)
 		}
 	}
+}
+
+func TestEmbeddedScripts_NounsetSafeGasTownEnv(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash is required for nounset test: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		env       []string
+		wantCalls []string
+	}{
+		{name: "unset", wantCalls: []string{"agent"}},
+		{name: "enabled", env: []string{"GASTOWN_ENABLED=1"}, wantCalls: []string{"gt prime", "agent"}},
+		{name: "disabled", env: []string{"GASTOWN_DISABLED=1"}, wantCalls: []string{"agent"}},
+		{
+			name:      "disabled takes precedence",
+			env:       []string{"GASTOWN_DISABLED=1", "GASTOWN_ENABLED=1"},
+			wantCalls: []string{"agent"},
+		},
+	}
+
+	for _, name := range expectedWrappers {
+		t.Run(name, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					tmpHome := t.TempDir()
+					binDir := filepath.Join(tmpHome, "bin")
+					if err := os.MkdirAll(binDir, 0755); err != nil {
+						t.Fatalf("creating bin directory: %v", err)
+					}
+
+					wrapperPath := filepath.Join(binDir, name)
+					content, err := scriptsFS.ReadFile("scripts/" + name)
+					if err != nil {
+						t.Fatalf("reading embedded %s: %v", name, err)
+					}
+					if err := os.WriteFile(wrapperPath, content, 0755); err != nil {
+						t.Fatalf("writing wrapper: %v", err)
+					}
+
+					callLog := filepath.Join(tmpHome, "calls")
+					target := strings.TrimPrefix(name, "gt-")
+					agentScript := "#!/bin/bash\nprintf '%s\\n' agent >> \"$GASTOWN_TEST_LOG\"\n"
+					if err := os.WriteFile(filepath.Join(binDir, target), []byte(agentScript), 0755); err != nil {
+						t.Fatalf("writing %s stub: %v", target, err)
+					}
+					gtScript := "#!/bin/bash\nprintf '%s\\n' \"gt $*\" >> \"$GASTOWN_TEST_LOG\"\n"
+					if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0755); err != nil {
+						t.Fatalf("writing gt stub: %v", err)
+					}
+
+					cmd := exec.Command(bashPath, "-u", wrapperPath, "argument")
+					cmd.Dir = tmpHome
+					cmd.Env = append(envWithout("GASTOWN_DISABLED", "GASTOWN_ENABLED", "GASTOWN_TEST_LOG", "HOME", "PATH"),
+						append([]string{
+							"HOME=" + tmpHome,
+							"PATH=" + binDir,
+							"GASTOWN_TEST_LOG=" + callLog,
+						}, tt.env...)...)
+
+					if output, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("bash -u %s failed: %v\nOutput: %s", name, err, output)
+					}
+
+					calls, err := os.ReadFile(callLog)
+					if err != nil {
+						t.Fatalf("reading call log: %v", err)
+					}
+					gotCalls := strings.Split(strings.TrimSpace(string(calls)), "\n")
+					if !reflect.DeepEqual(gotCalls, tt.wantCalls) {
+						t.Errorf("calls = %v, want %v", gotCalls, tt.wantCalls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func envWithout(keys ...string) []string {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		blocked[key] = struct{}{}
+	}
+
+	filtered := make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, found := blocked[key]; !found {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }

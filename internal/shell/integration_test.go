@@ -5,6 +5,7 @@ package shell
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -129,4 +130,72 @@ func TestUpdateRCFile(t *testing.T) {
 	if startCount != 1 {
 		t.Errorf("RC file has %d start markers, want 1", startCount)
 	}
+}
+
+func TestShellHook_NounsetSafeGasTownEnv(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash is required for nounset test: %v", err)
+	}
+
+	home := t.TempDir()
+	hookPath := filepath.Join(home, "shell-hook.sh")
+	if err := os.WriteFile(hookPath, []byte(shellHookScript), 0644); err != nil {
+		t.Fatalf("writing shell hook: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		env         []string
+		wantEnabled string
+	}{
+		{name: "unset", wantEnabled: "0"},
+		{name: "enabled", env: []string{"GASTOWN_ENABLED=1"}, wantEnabled: "1"},
+		{name: "disabled", env: []string{"GASTOWN_DISABLED=1"}, wantEnabled: "0"},
+		{
+			name:        "disabled takes precedence",
+			env:         []string{"GASTOWN_DISABLED=1", "GASTOWN_ENABLED=1"},
+			wantEnabled: "0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command(bashPath, "-u", "-c", `
+source "$1"
+if _gastown_enabled; then
+    result=1
+else
+    result=0
+fi
+[[ "$result" == "$2" ]]
+`, "bash", hookPath, tt.wantEnabled)
+			cmd.Dir = t.TempDir()
+			cmd.Env = append(envWithout("GASTOWN_DISABLED", "GASTOWN_ENABLED", "HOME", "SHELL"),
+				append([]string{"HOME=" + home, "SHELL=/bin/bash"}, tt.env...)...)
+
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("bash -u shell hook failed: %v\nOutput: %s", err, output)
+			}
+		})
+	}
+}
+
+func envWithout(keys ...string) []string {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		blocked[key] = struct{}{}
+	}
+
+	filtered := make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, found := blocked[key]; !found {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
